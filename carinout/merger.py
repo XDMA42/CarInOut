@@ -100,12 +100,20 @@ def read_csv_text(path: Path) -> pd.DataFrame:
 
 
 def filter_valid(df: pd.DataFrame) -> pd.DataFrame:
-    """只保留 errcode 为 0 的行（列名不区分大小写）。"""
+    """只保留 errcode 为 0 的行（列名不区分大小写）。
+
+    errcode 可以是十进制（0、0.0）或十六进制（0x00000000）；无法识别的值视为非 0。
+    """
     col = find_column(df, ERRCODE_COLUMN)
     if col is None:
         raise CsvReadError(f"缺少 {ERRCODE_COLUMN} 列")
-    codes = pd.to_numeric(df[col].str.strip(), errors="coerce")
-    return df[codes == 0].reset_index(drop=True)
+    codes = df[col].str.strip()
+    decimal = pd.to_numeric(codes, errors="coerce")
+    is_hex = codes.str.fullmatch(r"[+-]?0[xX][0-9a-fA-F]+")
+    if len(df) and not (decimal.notna() | is_hex).any():
+        raise CsvReadError(f"{ERRCODE_COLUMN} 的值无法识别（如 “{codes.iat[0]}”），应为 0 或 0x00000000 这样的格式")
+    is_zero = (decimal == 0) | codes.str.fullmatch(r"[+-]?0[xX]0+")
+    return df[is_zero].reset_index(drop=True)
 
 
 def load_anchor(paths: list[Path]) -> AnchorData:

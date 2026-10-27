@@ -226,6 +226,19 @@ def test_gbk_input_and_errcode_variants(tmp_path: Path):
     assert data.valid["TS"].tolist() == ["1", "2"]
 
 
+def test_hex_errcode(tmp_path: Path):
+    rows = ["0x00000000", "0", " 0X0 ", "0x00000001", "0x0000000A", "0x", "0x0000000g", "0x00000000"]
+    path = write(tmp_path / "a.csv", "ts,errcode\n" + "".join(f"{i},{c}\n" for i, c in enumerate(rows)))
+    data = load_anchor([path])
+    assert data.valid["ts"].tolist() == ["0", "1", "2", "7"]
+    assert data.valid["errcode"].tolist() == ["0x00000000", "0", " 0X0 ", "0x00000000"]  # 原文本保留
+
+
+def test_unrecognized_errcode_format_reported(tmp_path: Path):
+    data = load_anchor([write(tmp_path / "a.csv", "ts,errcode\n1,OK\n2,FAIL\n")])
+    assert data.valid is None and "无法识别" in data.error and "OK" in data.error
+
+
 @pytest.mark.parametrize("header, missing", [("ts,rssi", "errcode"), ("time,errcode", "ts")])
 def test_missing_required_column_reported(tmp_path: Path, header: str, missing: str):
     data = load_anchor([write(tmp_path / "a.csv", f"{header}\n1,0\n")])
