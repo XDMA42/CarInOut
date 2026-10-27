@@ -1,0 +1,36 @@
+{
+  "data": {
+    "dataset": "D:/data/merged/1023采集/_dataset.csv",
+    "test_dataset": "",
+    "features": [],
+    "label_column": "label",
+    "missing": "drop",
+    "fill_value": 0.0,
+    "standardize": true,
+    "split": "point",
+    "val_ratio": 0.2,
+    "test_ratio": 0.1
+  },
+  "model": {
+    "name": "mlp",
+    "params": {
+      "hidden_sizes": [
+        64,
+        32
+      ]
+    }
+  },
+  "train": {
+    "batch_size": 64,
+    "learning_rate": 0.001,
+    "epochs": 100,
+    "l2_lambda": 0.0001,
+    "optimizer": "adam",
+    "class_weight": "none",
+    "early_stopping": 0,
+    "seed": 42,
+    "device": "auto"
+  },
+  "output_dir": "runs",
+  "run_name": ""
+}

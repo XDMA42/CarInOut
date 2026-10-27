@@ -1,6 +1,9 @@
 # CarInOut
 
-钥匙车内外识别项目。第一步：把采集到的各锚点（SLAVE）CSV 按点位整合成数据集。
+钥匙车内外识别项目：
+
+1. [数据集构建工具](#数据集构建工具)（`python main.py`）：把采集到的各锚点（SLAVE）CSV 按点位整合成带标签的数据集。
+2. [模型训练平台](#模型训练平台)（`python train.py`）：在数据集上训练车内 / 车外二分类模型（默认 3 层 MLP），实时显示损失曲线和评价指标。
 
 ## 数据集构建工具
 
@@ -89,3 +92,149 @@ python -m pytest
   `main.py` 已在导入 numpy/pandas 前把 `OPENBLAS_NUM_THREADS` 等设为 1（本工具不做矩阵运算，不影响速度）。
   如果在其他脚本里直接 `import carinout`，请在导入 pandas 之前先设置这个环境变量。
   如果仍然报错，请检查是否为 32 位 Python：`python -c "import struct; print(struct.calcsize('P') * 8)"`，应输出 64。
+
+## 模型训练平台
+
+![训练过程](docs/train_loss.png)
+
+![评估结果](docs/train_eval.png)
+
+### 安装与启动
+
+```bash
+pip install -r requirements.txt
+python train.py                                # 图形界面
+python train.py --config configs/mlp.json      # 命令行训练（参数见 python train.py --help）
+```
+
+只用 CPU 训练时，可以先装 CPU 版 PyTorch，下载量小很多：
+`pip install torch --index-url https://download.pytorch.org/whl/cpu`。
+
+### 输入
+
+数据集构建工具导出的总表 `_dataset.csv`（`ts, rssi_FL, …, errcode_FL, …, scene, point, label`），`label`：1 = 车内，0 = 车外。
+
+- **候选特征**：能解析为数值的列，排除 `ts`、`ts_*`、`errcode_*`、`scene`、`point`、`label`。
+  默认勾选所有非常数的列；界面中可按列名筛选（如输入 `rssi` 后点“全选”），列表里显示每列的缺失比例。
+- **独立测试集**（可选）：例如用另一天采集的总表做测试集，评估跨天的泛化能力；指定后上面的数据只划分训练集和验证集。
+
+### 模型与损失
+
+- 默认模型 **MLP**：`输入 → Linear → ReLU → Linear → ReLU → Linear → 2 个 logits`，即 3 层全连接，
+  隐藏层节点数默认 `64, 32`。填几个数字就是几层隐藏层（如 `128, 64, 32` 为 4 层全连接）。
+- **损失 = 交叉熵 + λ × Σ‖W‖²**：L2 项只对权重计算，不含偏置；两部分分别记录，在损失曲线中单独显示。
+- 输出经 softmax 得到车内概率，≥ 0.5 判为车内；正类 = 车内。
+- 训练结束后自动换回**验证集交叉熵最低**那个 epoch 的模型参数（没有验证集时按训练集总损失），评估和保存都用它。
+
+### 可配置项
+
+界面左侧、配置文件（JSON，界面中“保存配置…”可导出）和命令行三者对应：
+
+| 配置项 | 配置文件 | 命令行 | 默认 |
+| --- | --- | --- | --- |
+| 输入特征 | `data.features`（空 = 全部非常数数值列） | `--features rssi_FL,rssi_F` | 全部 |
+| 隐藏层节点数 | `model.params.hidden_sizes` | `--hidden 64,32` | `[64, 32]` |
+| batch size | `train.batch_size` | `--batch-size` | 64 |
+| learning rate | `train.learning_rate` | `--lr` | 0.001 |
+| epoch 数 | `train.epochs` | `--epochs` | 100 |
+| L2 系数 λ | `train.l2_lambda` | `--l2` | 0.0001 |
+| 优化器 | `train.optimizer`：`adam` / `sgd`（momentum 0.9） | `--optimizer` | adam |
+| 类别权重 | `train.class_weight`：`none` / `balanced` | `--class-weight` | none |
+| 提前停止 | `train.early_stopping`：验证集交叉熵 N 个 epoch 无改善即停，0 不停 | `--early-stopping` | 0 |
+| 缺失值 | `data.missing`：`drop` 丢弃行 / `mean` 训练集均值 / `constant` 固定值（`data.fill_value`） | `--missing` | drop |
+| 标准化 | `data.standardize`：按训练集均值、标准差做 z-score | — | 开 |
+| 划分方式 | `data.split`：`point` 按点位整组 / `row` 按行随机 | `--split` | point |
+| 验证集 / 测试集比例 | `data.val_ratio` / `data.test_ratio` | `--val-ratio` / `--test-ratio` | 0.2 / 0.1 |
+| 独立测试集 | `data.test_dataset` | `--test-dataset` | 无 |
+| 随机种子 | `train.seed`（数据划分和模型初始化） | `--seed` | 42 |
+| 设备 | `train.device`：`auto` / `cpu` / `cuda` | `--device` | auto |
+
+命令行参数会覆盖配置文件中的同名项，例如
+`python train.py --config configs/mlp.json --hidden 128,64 --lr 3e-4 --name h128-64`。
+
+**为什么默认按点位划分**：同一点位相邻时刻的样本几乎一样，按行随机划分时验证集里的点位训练集都“见过”，
+指标会偏乐观。按 (场景, 点位) 整组划分（并按标签分层），验证 / 测试集衡量的是对**没见过的位置**的判断能力。
+
+### 训练可视化
+
+- **损失曲线**：总损失、交叉熵、L2 正则项三张图，训练集与验证集对比，竖线标出最佳 epoch。
+  鼠标移到图上显示该 epoch 的数值；工具栏可缩放、平移、保存图片。
+- **评价指标**：验证集的准确率、精确率、召回率、F1、AUC 随 epoch 的变化。
+- **评估结果**：最佳模型在训练 / 验证 / 测试集上的指标表，验证集和测试集的混淆矩阵、ROC 曲线，
+  以及**各点位的准确率**（从低到高，准确率低于 80% 标黄），方便找出容易判错的位置。
+- **训练记录**：每个 epoch 的全部数值，最佳 epoch 一行高亮。
+- **打开训练结果…**：重新查看以前某次训练的曲线和评估结果，并把它的配置载入左侧，方便对比、微调后再训练。
+
+### 训练结果
+
+每次训练在保存位置（默认 `runs/`）下新建一个文件夹 `时间_名称`：
+
+| 文件 | 内容 |
+| --- | --- |
+| `config.json` | 本次完整配置（`features` 为实际使用的特征），`python train.py --config` 可直接复现 |
+| `history.csv` | 每个 epoch 的损失与验证集指标 |
+| `metrics.json` | 最佳模型在各数据集上的指标、混淆矩阵 `[[TN, FP], [FN, TP]]`，以及数据划分说明 |
+| `predictions.csv` | 每个样本的 `split, ts, scene, point, label, prob`（车内概率）`, pred` |
+| `model.pt` | 模型参数 + 特征列表 + 缺失值填充值 + 标准化参数 |
+| `loss.png` / `metrics.png` / `evaluation.png` | 图表 |
+
+用训练好的模型推理（会按训练时的方式选特征、填充缺失值、标准化）：
+
+```python
+from carinout.training.data import load_table
+from carinout.training.runs import Predictor
+
+predictor = Predictor.load("runs/20261027-153012_mlp")    # 结果文件夹或其中的 model.pt
+prob = predictor.predict_proba(load_table("新数据/_dataset.csv"))  # 车内概率
+```
+
+### 更换模型（模块化）
+
+```
+carinout/training/
+  config.py    配置（JSON 读写与校验）
+  data.py      读取总表、选特征、缺失值、划分、标准化
+  models/      模型注册表：base.py（ModelSpec / ParamSpec）、mlp.py
+  losses.py    交叉熵 + L2
+  trainer.py   训练循环、最佳 epoch、提前停止、评估
+  metrics.py   准确率 / 精确率 / 召回率 / F1 / AUC / ROC / 混淆矩阵
+  plots.py     图表（界面与 PNG 共用）
+  runs.py      训练结果保存 / 读取，Predictor 推理
+  cli.py       命令行
+carinout/gui/train_window.py, train_charts.py   界面
+```
+
+模型只需满足：`nn.Module`，输入 `(batch, 特征数)`，输出 `(batch, 2)` 的 logits。新增一种模型：
+在 `carinout/training/models/` 下新建模块，声明它的超参数，并在 `models/__init__.py` 的 `_BUILTIN` 中加入。
+界面会自动出现该模型和对应的参数输入框，数据处理、训练、评估、可视化、保存与推理都不需要修改。
+
+```python
+# carinout/training/models/resmlp.py（示例）
+from torch import nn
+from .base import KIND_FLOAT, KIND_INT, ModelSpec, ParamSpec
+
+class ResMLP(nn.Module):
+    def __init__(self, in_features, num_classes, width, blocks, dropout):
+        ...
+
+SPEC = ModelSpec(
+    name="resmlp",
+    label="残差 MLP",
+    description="带残差连接和 Dropout 的全连接网络",
+    params=(
+        ParamSpec("width", "宽度", KIND_INT, 64, minimum=1),
+        ParamSpec("blocks", "残差块数", KIND_INT, 2, minimum=1),
+        ParamSpec("dropout", "Dropout", KIND_FLOAT, 0.1, minimum=0, maximum=0.9),
+    ),
+    factory=lambda in_features, num_classes, **p: ResMLP(in_features, num_classes, **p),
+)
+```
+
+### 常见问题
+
+- **图表中的中文显示为方框**：matplotlib 会自动选用系统里的中文字体（微软雅黑、黑体、苹方、Noto Sans CJK、文泉驿等），
+  都没有时请安装其中一种。
+- **Windows 上报 `OSError: [WinError 1114] … c10.dll`**：PyTorch 要在 PySide6 之前导入，`train.py` 已经这样处理；
+  在自己的脚本里同时用到两者时也请先 `import torch`。
+- **训练集准确率很高、验证集明显偏低**：模型记住了训练点位。可以加大 L2 系数、减少隐藏层节点数、开启提前停止，
+  或者补充更多点位的数据。
