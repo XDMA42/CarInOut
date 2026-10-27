@@ -262,6 +262,8 @@ class MainWindow(QMainWindow):
         self.join_combo.currentIndexChanged.connect(self._refresh_point)
         self.tolerance_spin.valueChanged.connect(self._refresh_point)
         self.complete_check = QCheckBox("只导出已映射锚点齐全的点位")
+        self.complete_check.setToolTip("勾选后，任一已映射锚点在该点位缺失文件、读取失败或没有 errcode=0 的行，整个点位都不导出")
+        self.complete_check.toggled.connect(self._refresh_point)
         self.combined_check = QCheckBox(f"生成总表 {COMBINED_FILENAME}（追加 scene / point / label 列）")
         self.combined_check.setChecked(True)
         self.combined_check.setToolTip("所有已标注场景的数据合在一个文件里，label：1 = 车内，0 = 车外；未标注的场景不写入总表")
@@ -610,7 +612,8 @@ class MainWindow(QMainWindow):
                 coverage[key] = Coverage(False, "读取失败")
             else:
                 coverage[key] = Coverage(data.valid_rows > 0, f"有效 {data.valid_rows}/{data.total_rows} 行")
-                frames.append((self.config.anchor_names[key], data.valid))
+                if data.valid_rows > 0:  # 与导出一致：没有有效数据的锚点不参与对齐
+                    frames.append((self.config.anchor_names[key], data.valid))
         self.car.set_coverage(coverage)
 
         title = [f"{point[0]} / 点位 {point[1]}", LABEL_TEXT.get(self.config.scene_labels.get(point[0]), "未标注")]
@@ -624,6 +627,14 @@ class MainWindow(QMainWindow):
                     title.append(f"⚠ {','.join(unsynced)} 的 ts 对不上")
             except ValueError as exc:
                 title.append(f"ts 对齐失败：{exc}")
+        expected = {self.config.slave_mapping.get(s) for s in self.slaves} - {None}
+        lacking = [
+            self.config.anchor_names[k]
+            for k in SLOT_KEYS
+            if k in expected and not (k in coverage and coverage[k].ok)
+        ]
+        if lacking and self.complete_check.isChecked():
+            title.append(f"⚠ 导出时会跳过：{','.join(lacking)} 缺失或无有效数据")
         self._update_car_title("  ·  ".join(title))
 
         lines = [f"[{point[0]}_{point[1]}]"]
@@ -739,6 +750,8 @@ class MainWindow(QMainWindow):
         skipped = len(results) - len(exported)
         rows = sum(r.rows for r in exported)
         msg = f"完成：导出 {len(exported)} 个点位，共 {rows} 行；跳过 {skipped} 个。汇总见 _summary.csv"
+        if skipped:
+            msg += "（跳过原因见日志或 _summary.csv 的“状态”列）"
         if self.combined_check.isChecked():
             msg += f"，总表见 {COMBINED_FILENAME}"
         if len(results) < len(self.groups):

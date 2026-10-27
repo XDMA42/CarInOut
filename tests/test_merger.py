@@ -118,7 +118,7 @@ def test_low_match_rate_flagged(tmp_path: Path):
     write(src / "s-1-[SLAVE1].csv", "ts,errcode\n" + "".join(f"{i},0\n" for i in range(10)))
     write(src / "s-1-[SLAVE2].csv", "ts,errcode\n" + "".join(f"{i}.5,0\n" for i in range(10)))
     _, results = run(src, {"SLAVE1": "FL", "SLAVE2": "FR"})
-    assert results[0].output is None and "相同的 ts" in results[0].status
+    assert results[0].output is None and "ts 对不上" in results[0].status
     write(src / "s-1-[SLAVE2].csv", "ts,errcode\n0,0\n" + "".join(f"{i}.5,0\n" for i in range(9)))
     _, results = run(src, {"SLAVE1": "FL", "SLAVE2": "FR"})
     assert results[0].rows == 1 and "对不上" in results[0].status
@@ -179,6 +179,37 @@ def test_require_complete_skips_incomplete_points(folder: Path):
     assert not (out / "座椅_54.csv").exists()
     skipped = next(r for r in results if r.point == "54")
     assert "FR" in skipped.status
+
+
+@pytest.fixture
+def one_bad_anchor(tmp_path: Path) -> Path:
+    src = tmp_path / "src"
+    src.mkdir()
+    write(src / "座椅-1-[SLAVE1].csv", "ts,rssi,errcode\n100,-50,0\n200,-51,0\n")
+    write(src / "座椅-1-[SLAVE2].csv", "ts,rssi,errcode\n100,-60,0\n200,-61,0\n")
+    write(src / "座椅-1-[SLAVE3].csv", "ts,rssi,errcode\n100,-70,7\n200,-71,7\n")  # 全部 errcode≠0
+    write(src / "座椅-2-[SLAVE1].csv", "ts,rssi,errcode\n100,-50,0\n")
+    write(src / "座椅-2-[SLAVE2].csv", "ts,rssi,errcode\n100,-60,0\n")
+    write(src / "座椅-2-[SLAVE3].csv", "ts,rssi\n100,-70\n")  # 缺 errcode 列
+    return src
+
+
+def test_require_complete_reports_reason(one_bad_anchor: Path):
+    _, results = run(one_bad_anchor, {"SLAVE1": "FL", "SLAVE2": "FR", "SLAVE3": "IF"}, require_complete=True)
+    assert [r.output for r in results] == [None, None]
+    assert "IF 无 errcode=0 的行（共 2 行）" in results[0].status
+    assert "IF 读取失败（缺少 errcode 列）" in results[1].status
+    assert all("只导出已映射锚点齐全" in r.status for r in results)
+
+
+def test_anchor_without_valid_rows_does_not_empty_point(one_bad_anchor: Path):
+    # 不要求锚点齐全时，没有有效数据的锚点和缺失的锚点一样被略过，而不是让 ts 交集变空
+    out, results = run(one_bad_anchor, {"SLAVE1": "FL", "SLAVE2": "FR", "SLAVE3": "IF"})
+    df = read_out(out / "座椅_1.csv")
+    assert list(df.columns) == ["ts", "rssi_FL", "errcode_FL", "rssi_FR", "errcode_FR"]
+    assert df["ts"].tolist() == ["100", "200"]
+    assert "IF 无 errcode=0 的行" in results[0].status
+    assert results[1].rows == 1 and "IF 读取失败" in results[1].status
 
 
 def test_conflicting_mapping_rejected(folder: Path):

@@ -40,11 +40,20 @@ class CsvReadError(Exception):
 class AnchorData:
     valid: pd.DataFrame | None
     total_rows: int = 0
-    error: str = ""
+    error: str = ""  # 读取失败的原因
+    error_file: str = ""  # 读取失败的文件名
 
     @property
     def valid_rows(self) -> int:
         return 0 if self.valid is None else len(self.valid)
+
+    def problem(self) -> str:
+        """该锚点不可用的原因；有有效数据时返回空串。"""
+        if self.error:
+            return f"读取失败（{self.error}）"
+        if self.valid_rows == 0:
+            return f"无 errcode=0 的行（共 {self.total_rows} 行）"
+        return ""
 
 
 @dataclass
@@ -111,7 +120,7 @@ def load_anchor(paths: list[Path]) -> AnchorData:
             total += len(df)
             frames.append(filter_valid(df))
     except CsvReadError as exc:
-        return AnchorData(None, total, f"{path.name}: {exc}")
+        return AnchorData(None, total, str(exc), path.name)
     return AnchorData(pd.concat(frames, ignore_index=True), total)
 
 
@@ -264,7 +273,7 @@ def build_dataset(
         results.append(result)
         for name, data in result.anchors.items():
             if data.error:
-                log(f"[{scene}_{point}] 锚点 {name} 读取失败：{data.error}")
+                log(f"[{scene}_{point}] 锚点 {name} 读取失败：{data.error_file}: {data.error}")
         log(f"[{scene}_{point}] {result.status}")
         if merged is not None and scene_labels is not None and scene in scene_labels:
             labeled_frames.append(
@@ -307,34 +316,34 @@ def _merge_point(
     result = PointResult(scene, point, None, 0, "", anchors)
 
     missing = [name for name in expected if name not in anchors]
-    unusable = [name for name, data in anchors.items() if data.valid_rows == 0]
-    if options.require_complete and (missing or unusable):
-        parts = []
-        if missing:
-            parts.append("缺少锚点 " + ",".join(missing))
-        if unusable:
-            parts.append("无有效数据 " + ",".join(unusable))
-        result.status = "跳过：" + "；".join(parts)
+    problems = (["缺少锚点 " + ",".join(missing)] if missing else []) + [
+        f"{name} {data.problem()}" for name, data in anchors.items() if data.problem()
+    ]
+    if options.require_complete and problems:
+        result.status = "跳过（已勾选“只导出已映射锚点齐全的点位”）：" + "；".join(problems)
         return result, None
 
-    frames = [(name, data.valid) for name, data in anchors.items() if data.valid is not None]
+    # 没有有效数据的锚点与缺失的锚点同样处理：不参与对齐，否则会把整个点位的交集清空
+    frames = [(name, data.valid) for name, data in anchors.items() if data.valid_rows > 0]
+    if not frames:
+        result.status = "跳过：没有可用的锚点数据（" + "；".join(problems) + "）"
+        return result, None
     try:
         merged = align_by_ts(frames, options.join, options.ts_tolerance)
     except ValueError as exc:
         result.status = f"失败：{exc}"
         return result, None
     if merged.empty:
-        result.status = "跳过：按 ts 对齐后没有数据" + (
-            f"（{','.join(unusable)} 无 errcode=0 的行）" if unusable else "（各锚点没有相同的 ts）"
-        )
+        hint = "可调大 ts 容差" if options.ts_tolerance > 0 else "可设置 ts 容差"
+        result.status = f"跳过：按 ts 对齐后没有数据（各锚点的 ts 对不上，{hint}）"
         return result, None
 
     output = out_dir / f"{scene}_{point}.csv"
     merged.to_csv(output, index=False, encoding=options.output_encoding)
     result.output, result.rows = output, len(merged)
     result.status = f"已导出 {len(merged)} 行"
-    if missing:
-        result.status += "（缺少锚点 " + ",".join(missing) + "）"
+    if problems:
+        result.status += "（" + "；".join(problems) + "）"
     if options.ts_tolerance == 0:
         unsynced = unsynced_anchors(frames)
         if unsynced:
