@@ -249,3 +249,12 @@ def test_multiple_files_same_anchor_concatenated(tmp_path: Path):
     a = write(tmp_path / "a.csv", "ts,v,errcode\n1,1,0\n2,2,1\n")
     b = write(tmp_path / "b.csv", "ts,v,errcode\n3,3,0\n")
     assert load_anchor([a, b]).valid["v"].tolist() == ["1", "3"]
+
+
+def test_dataset_folder_named_after_input(tmp_path: Path):
+    from carinout.merger import dataset_folder
+
+    raw = tmp_path / "data" / "1023采集"
+    raw.mkdir(parents=True)
+    assert dataset_folder(raw) == tmp_path / "data" / "merged" / "1023采集"
+    assert dataset_folder(raw, tmp_path / "out") == tmp_path / "out" / "1023采集"

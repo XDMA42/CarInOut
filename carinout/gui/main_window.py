@@ -47,6 +47,7 @@ from ..merger import (
     PointResult,
     align_by_ts,
     build_dataset,
+    dataset_folder,
     load_anchor,
     unsynced_anchors,
 )
@@ -105,6 +106,7 @@ class MainWindow(QMainWindow):
         self._thread: QThread | None = None
         self._worker: ExportWorker | None = None
         self._out_dir: Path | None = None
+        self._input_dir: Path | None = None  # 当前已解析的原始数据文件夹
         self._combos: dict[str, QComboBox] = {}
 
         self.car = CarView()
@@ -141,6 +143,7 @@ class MainWindow(QMainWindow):
 
         self._refresh_mapping_view()
         self._update_car_title()
+        self._update_target_label()
         if self.config.last_input_dir and Path(self.config.last_input_dir).is_dir():
             self.input_edit.setText(self.config.last_input_dir)
             self._parse_folder()
@@ -239,12 +242,16 @@ class MainWindow(QMainWindow):
 
         ebox = QGroupBox("合并导出")
         self.output_edit = QLineEdit(self.config.last_output_dir)
-        self.output_edit.setPlaceholderText("默认：输入文件夹/merged")
+        self.output_edit.setPlaceholderText("默认：与原始数据文件夹同级的 merged")
+        self.output_edit.textChanged.connect(self._update_target_label)
         obrowse = QPushButton("浏览…")
         obrowse.clicked.connect(self._choose_output)
         orow = QHBoxLayout()
         orow.addWidget(self.output_edit, 1)
         orow.addWidget(obrowse)
+        self.target_label = QLabel()
+        self.target_label.setWordWrap(True)
+        self.target_label.setStyleSheet("color: gray")
 
         self.join_combo = QComboBox()
         self.join_combo.addItem("只保留所有锚点都有数据的 ts", JOIN_INNER)
@@ -284,8 +291,9 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
 
         elay = QVBoxLayout(ebox)
-        elay.addWidget(QLabel("输出文件夹"))
+        elay.addWidget(QLabel("输出位置（会在其中建立与原始数据文件夹同名的文件夹）"))
         elay.addLayout(orow)
+        elay.addWidget(self.target_label)
         elay.addLayout(form)
         elay.addWidget(self.complete_check)
         elay.addWidget(self.combined_check)
@@ -313,6 +321,20 @@ class MainWindow(QMainWindow):
         if folder:
             self.output_edit.setText(folder)
 
+    def _target_dir(self) -> Path:
+        """实际导出目录：输出位置 / 原始数据文件夹名。"""
+        out_text = self.output_edit.text().strip()
+        return dataset_folder(self._input_dir, Path(out_text) if out_text else None)
+
+    def _update_target_label(self) -> None:
+        if self._input_dir is None:
+            self.target_label.setText("解析数据后显示导出路径")
+            return
+        target = str(self._target_dir())
+        # 在路径分隔符后插入零宽空格，长路径可以换行显示
+        self.target_label.setText("将导出到：" + target.replace("/", "/\u200b").replace("\\", "\\\u200b"))
+        self.target_label.setToolTip(target)
+
     def _parse_folder(self) -> None:
         folder = Path(self.input_edit.text().strip())
         if not self.input_edit.text().strip() or not folder.is_dir():
@@ -331,6 +353,8 @@ class MainWindow(QMainWindow):
         self.config.filename_pattern = pattern
         self.config.last_input_dir = str(folder)
         self._save_config()
+        self._input_dir = folder
+        self._update_target_label()
 
         self.groups = group_by_point(parsed)
         self.slaves = sorted({f.slave for f in parsed}, key=natural_key)
@@ -696,9 +720,16 @@ class MainWindow(QMainWindow):
                 if ok != QMessageBox.StandardButton.Yes:
                     return
 
-        out_text = self.output_edit.text().strip()
-        out_dir = Path(out_text) if out_text else Path(self.input_edit.text().strip()) / "merged"
-        self.config.last_output_dir = out_text
+        out_dir = self._target_dir()
+        if out_dir.is_dir() and any(out_dir.iterdir()):
+            ok = QMessageBox.question(
+                self,
+                "输出文件夹已存在",
+                f"{out_dir}\n已存在且不为空，其中的同名文件会被覆盖，其他文件保留。是否继续？",
+            )
+            if ok != QMessageBox.StandardButton.Yes:
+                return
+        self.config.last_output_dir = self.output_edit.text().strip()
         self._save_config()
 
         names = self.config.anchor_names

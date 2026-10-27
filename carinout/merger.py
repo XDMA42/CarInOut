@@ -76,6 +76,13 @@ class PointResult:
     anchors: dict[str, AnchorData] = field(default_factory=dict)
 
 
+def dataset_folder(input_dir: Path, base: Path | None = None) -> Path:
+    """导出目录：base / 原始数据文件夹名；未指定 base 时为与原始数据文件夹同级的 merged 文件夹。"""
+    input_dir = input_dir.resolve()
+    base = base or input_dir.parent / "merged"
+    return base / (input_dir.name or "dataset")
+
+
 def find_column(df: pd.DataFrame, name: str) -> str | None:
     """不区分大小写查找列名。"""
     return next((c for c in df.columns if c.lower() == name), None)
