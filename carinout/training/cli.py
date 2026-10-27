@@ -15,7 +15,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 
 from .config import ExperimentConfig
-from .data import SPLIT_NAMES, feature_candidates, load_table
+from .data import SPLIT_NAMES, feature_candidates, load_table, resolve_datasets
 from .metrics import METRIC_NAMES
 from .models import available_models, get_spec
 from .sweep import RANK_METRICS
@@ -28,7 +28,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="车内外识别模型训练。不带参数运行时打开图形界面。命令行参数会覆盖配置文件中的同名项。",
     )
     p.add_argument("--config", help="训练配置 JSON（可在界面中“保存配置”得到）")
-    p.add_argument("--dataset", help="数据集构建工具导出的 _dataset.csv")
+    p.add_argument(
+        "--dataset",
+        action="append",
+        metavar="文件夹",
+        help="训练数据，可重复：含 _dataset.csv 的文件夹、其上级文件夹（取各子文件夹）或 csv 文件",
+    )
     p.add_argument(
         "--val-dataset",
         action="append",
@@ -73,7 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
 def apply_args(cfg: ExperimentConfig, args: argparse.Namespace) -> ExperimentConfig:
     d, t = cfg.data, cfg.train
     simple = {
-        "dataset": (d, "dataset"),
+        "dataset": (d, "datasets"),
         "val_dataset": (d, "val_datasets"),
         "test_dataset": (d, "test_datasets"),
         "missing": (d, "missing"),
@@ -127,9 +132,10 @@ def main(argv: list[str]) -> int:
 
 
 def _list_features(cfg: ExperimentConfig) -> int:
-    if not cfg.data.dataset:
-        raise ValueError("请用 --dataset 指定数据集")
-    for info in feature_candidates(load_table(cfg.data.dataset), cfg.data.label_column):
+    if not cfg.data.datasets:
+        raise ValueError("请用 --dataset 指定训练数据")
+    tables = [load_table(path) for path in resolve_datasets(cfg.data.datasets)]
+    for info in feature_candidates(tables, cfg.data.label_column):
         flags = ("  常数" if info.constant else "") + (f"  缺失 {info.missing_ratio:.1%}" if info.missing_ratio else "")
         print(info.name + flags)
     return 0

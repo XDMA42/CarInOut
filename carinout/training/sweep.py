@@ -199,6 +199,7 @@ def run_sweep(
     keys = list(trials[0].overrides)
     saved_base = ExperimentConfig.from_dict(base.to_dict())
     saved_base.data.features = list(data.features)
+    saved_base.data.datasets = list(data.train_files)
     saved_base.data.val_datasets, saved_base.data.test_datasets = list(data.val_files), list(data.test_files)
     (sweep_dir / SWEEP_FILE).write_text(
         json.dumps(

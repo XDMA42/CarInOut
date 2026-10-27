@@ -32,7 +32,7 @@ from synthetic import make_dataset
 def base(tmp_path: Path) -> ExperimentConfig:
     dataset = make_dataset(tmp_path / "_dataset.csv", n_inside=6, n_outside=6, rows_per_point=15)
     return ExperimentConfig(
-        data=DataConfig(dataset=str(dataset)),
+        data=DataConfig(datasets=[str(dataset)]),
         model=ModelConfig("mlp", {"hidden_sizes": [16, 8]}),
         train=OptimConfig(epochs=3, batch_size=32, learning_rate=0.01),
         output_dir=str(tmp_path / "runs"),
@@ -143,7 +143,7 @@ def test_cli_sweep(base: ExperimentConfig, tmp_path: Path, capsys):
     val = tmp_path / "val_day"
     val.mkdir()
     make_dataset(val / "_dataset.csv", n_inside=3, n_outside=3, rows_per_point=10, seed=9)
-    args = ["--dataset", base.data.dataset, "--epochs", "2", "--hidden", "8,4", "--output-dir", str(out),
+    args = ["--dataset", base.data.datasets[0], "--epochs", "2", "--hidden", "8,4", "--output-dir", str(out),
             "--sweep", "lr=0.01,0.001", "--sweep", "hidden2=2,4", "--workers", "2", "--rank-by", "val_auc",
             "--val-dataset", str(val)]
     assert cli_main(args) == 0
@@ -156,8 +156,8 @@ def test_cli_sweep(base: ExperimentConfig, tmp_path: Path, capsys):
     assert sorted(zip(results["train.learning_rate"], results["model.hidden_sizes[1]"])) == [
         (0.001, 2), (0.001, 4), (0.01, 2), (0.01, 4)]
     assert "按验证集 AUC排序" in capsys.readouterr().out
-    assert cli_main(["--dataset", base.data.dataset, "--sweep", "hidden5=8"]) == 1
-    assert cli_main(["--dataset", base.data.dataset, "--sweep", "bs"]) == 1
+    assert cli_main(["--dataset", base.data.datasets[0], "--sweep", "hidden5=8"]) == 1
+    assert cli_main(["--dataset", base.data.datasets[0], "--sweep", "bs"]) == 1
 
 
 def test_draw_sweep():

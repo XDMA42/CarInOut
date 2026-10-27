@@ -3,7 +3,8 @@
 钥匙车内外识别项目：
 
 1. [数据集构建工具](#数据集构建工具)（`python main.py`）：把采集到的各锚点（SLAVE）CSV 按点位整合成带标签的数据集。
-2. [模型训练平台](#模型训练平台)（`python train.py`）：在数据集上训练车内 / 车外二分类模型（默认 3 层 MLP），实时显示损失曲线和评价指标；
+2. [模型训练平台](#模型训练平台)（`python train.py`）：在一个或多个数据集文件夹上训练车内 / 车外二分类模型（默认 3 层 MLP），
+   实时显示损失曲线和评价指标；
    支持[参数遍历](#参数遍历)，多进程并行训练多组超参数并比较。
 
 ## 数据集构建工具
@@ -106,7 +107,8 @@ python -m pytest
 pip install -r requirements.txt
 python train.py                                # 图形界面
 python train.py --config configs/mlp.json      # 命令行训练（参数见 python train.py --help）
-python train.py --config configs/mlp.json --val-dataset D:/data/merged/1024采集 --val-dataset D:/data/merged/1025采集
+python train.py --dataset D:/data/merged/1023采集 --dataset D:/data/merged/1024采集 \
+                --val-dataset D:/data/merged/1025采集        # 多个训练 / 验证文件夹
 ```
 
 只用 CPU 训练时，可以先装 CPU 版 PyTorch，下载量小很多：
@@ -115,17 +117,27 @@ python train.py --config configs/mlp.json --val-dataset D:/data/merged/1024采�
 ### 输入
 
 数据集构建工具导出的总表 `_dataset.csv`（`ts, rssi_FL, …, errcode_FL, …, scene, point, label`），`label`：1 = 车内，0 = 车外。
+训练数据、独立验证集、独立测试集都以**文件夹**为单位添加，每个文件夹里有一个 `_dataset.csv`
+（即数据集构建工具的导出文件夹，如 `merged/1023采集/`），三者都可以有多个文件夹：
+
+- 点“添加文件夹…”，或从资源管理器把一个或多个文件夹拖进列表；也可以“添加文件…”直接选 csv。
+  选择上级文件夹（如 `merged/`）会添加其中所有含 `_dataset.csv` 的子文件夹。
+- 同一个文件夹只能出现在训练数据、验证集、测试集其中之一；添加时已在其他列表中的文件夹会自动跳过并提示。
+
+**训练数据**：多个文件夹的数据合在一起训练。
+
+- 候选特征为**每个文件夹都有的**数值列；只在部分文件夹中出现的列不列入，日志中会提示。
+- 未指定独立验证集 / 测试集时，从合并后的训练数据中按比例划分。按点位划分时，
+  **不同文件夹中场景、点位都相同的数据视为同一位置**，分在同一个集合，避免同一位置既出现在训练集又出现在验证集。
+- 评估结果中训练集（以及从中划分的验证集 / 测试集）也会按文件夹分别列出指标。
 
 - **候选特征**：能解析为数值的列，排除 `ts`、`ts_*`、`errcode_*`、`scene`、`point`、`label`。
   默认勾选所有非常数的列；界面中可按列名筛选（如输入 `rssi` 后点“全选”），列表里显示每列的缺失比例。
-- **独立验证集 / 独立测试集**（可选，各自可以有多个文件夹）：例如用其他几天采集的数据做验证集、测试集，
-  评估跨天的泛化能力。每个文件夹里有一个 `_dataset.csv`（即数据集构建工具的导出文件夹，如 `merged/1024采集/`）。
-  - 点“添加文件夹…”，或从资源管理器把一个或多个文件夹拖进列表。
-    选择上级文件夹（如 `merged/`）会添加其中所有含 `_dataset.csv` 的子文件夹，训练数据所在的文件夹会自动跳过。
-  - 多个文件夹的数据合在一起作为验证集（或测试集），用于选最佳 epoch、提前停止、比较参数组合；
-    评估结果中还会按文件夹分别列出指标，看出每次采集的表现。
-  - 指定后，对应的“验证集比例” / “测试集比例”不生效，训练数据不再划出这部分。
-  - 同一份数据不能既用于训练又用于验证 / 测试，也不能同时出现在验证集和测试集中，否则开始训练时会报错。
+**独立验证集 / 独立测试集**（可选）：例如用其他几天采集的数据做验证集、测试集，评估跨天的泛化能力。
+
+- 多个文件夹的数据合在一起作为验证集（或测试集），用于选最佳 epoch、提前停止、比较参数组合；
+  评估结果中还会按文件夹分别列出指标，看出每次采集的表现。
+- 指定后，对应的“验证集比例” / “测试集比例”不生效，训练数据不再划出这部分。
 
 ### 模型与损失
 
@@ -141,6 +153,7 @@ python train.py --config configs/mlp.json --val-dataset D:/data/merged/1024采�
 
 | 配置项 | 配置文件 | 命令行 | 默认 |
 | --- | --- | --- | --- |
+| 训练数据 | `data.datasets`（文件夹列表） | `--dataset 文件夹`（可重复） | 无 |
 | 输入特征 | `data.features`（空 = 全部非常数数值列） | `--features rssi_FL,rssi_F` | 全部 |
 | 隐藏层节点数 | `model.params.hidden_sizes` | `--hidden 64,32` | `[64, 32]` |
 | batch size | `train.batch_size` | `--batch-size` | 64 |
@@ -224,7 +237,7 @@ python train.py --config configs/mlp.json --workers 8 \
 
 | 文件 | 内容 |
 | --- | --- |
-| `config.json` | 本次完整配置（`features` 为实际使用的特征，独立验证集 / 测试集为实际使用的文件），`python train.py --config` 可直接复现 |
+| `config.json` | 本次完整配置（`features` 为实际使用的特征，训练数据 / 验证集 / 测试集为实际使用的文件），`python train.py --config` 可直接复现 |
 | `history.csv` | 每个 epoch 的损失与验证集指标 |
 | `metrics.json` | 最佳模型在各数据集上的指标、混淆矩阵 `[[TN, FP], [FN, TP]]`、按文件夹的指标（`sources`），以及数据划分说明 |
 | `predictions.csv` | 每个样本的 `split, source`（来自哪个文件夹）`, ts, scene, point, label, prob`（车内概率）`, pred` |
@@ -238,7 +251,7 @@ from carinout.training.data import load_table
 from carinout.training.runs import Predictor
 
 predictor = Predictor.load("runs/20261027-153012_mlp")    # 结果文件夹或其中的 model.pt
-prob = predictor.predict_proba(load_table("新数据/_dataset.csv"))  # 车内概率
+prob = predictor.predict_proba(load_table("D:/data/merged/1027采集/_dataset.csv"))  # 车内概率
 ```
 
 ### 更换模型（模块化）

@@ -1,4 +1,4 @@
-"""可放入多个文件夹的数据集列表，独立验证集、独立测试集共用。
+"""可放入多个文件夹的数据集列表，训练数据、独立验证集、独立测试集共用。
 
 每项是含 _dataset.csv 的文件夹（或 csv 文件）。选择上级文件夹（如数据集构建工具的 merged）时，
 添加其中所有含 _dataset.csv 的子文件夹。也可以从资源管理器把一个或多个文件夹拖进列表。
@@ -64,7 +64,7 @@ class DatasetList(QWidget):
         exclude: Callable[[], dict[str, str]],
         parent=None,
     ) -> None:
-        """empty_text / filled_text：列表为空 / 非空时的说明（filled_text 中的 {n} 为文件夹数）。
+        """empty_text / filled_text：列表为空 / 非空时的说明（filled_text 中的 {n} 为文件夹数，为空时不显示）。
         exclude 返回不能添加的数据 {路径: 原因}，如训练数据、已在另一个列表中的文件夹。"""
         super().__init__(parent)
         self._empty_text = empty_text
@@ -77,7 +77,6 @@ class DatasetList(QWidget):
         # 路径过长时省略中间部分，保留开头的名称和路径末尾
         self.list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.list.setMaximumHeight(96)
         self.list.setToolTip(f"每项是一个含 {COMBINED_FILENAME} 的文件夹，可以从资源管理器拖入一个或多个文件夹")
         self.list.dropped.connect(self.add_paths)
         self.summary = QLabel()
@@ -90,12 +89,16 @@ class DatasetList(QWidget):
             f"选择上级文件夹（如 merged）时，添加其中所有含 {COMBINED_FILENAME} 的子文件夹"
         )
         add.clicked.connect(self._choose)
+        add_file = QPushButton("添加文件…")
+        add_file.setToolTip("直接选择 csv 文件（可多选），用于文件名不是 _dataset.csv 的总表")
+        add_file.clicked.connect(self._choose_files)
         remove = QPushButton("移除")
         remove.clicked.connect(self._remove_selected)
         clear = QPushButton("清空")
         clear.clicked.connect(lambda: self.set_paths([], notify=True))
         buttons = QHBoxLayout()
         buttons.addWidget(add)
+        buttons.addWidget(add_file)
         buttons.addWidget(remove)
         buttons.addWidget(clear)
 
@@ -120,6 +123,7 @@ class DatasetList(QWidget):
 
     def add_paths(self, paths: list[str]) -> None:
         """添加文件夹或 csv；上级文件夹展开为其中含 _dataset.csv 的各子文件夹，已有的不重复添加。"""
+        count = self.list.count()
         existing = {f.resolve() for f in _resolve_quietly(self.paths())}
         excluded = {}
         for path, reason in self._exclude().items():
@@ -139,7 +143,8 @@ class DatasetList(QWidget):
                     existing.add(key)
                     self._append(str(file.parent if file.name == COMBINED_FILENAME else file))
         self._refresh()
-        self.changed.emit()
+        if self.list.count() != count:
+            self.changed.emit()
         if skipped:
             errors.append("已跳过：" + "、".join(skipped))
         if errors:
@@ -163,15 +168,27 @@ class DatasetList(QWidget):
         if folder:
             self.add_paths([folder])
 
+    def _choose_files(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(self, "选择数据集文件", self._start_dir(), "CSV 文件 (*.csv)")
+        if files:
+            self.add_paths(files)
+
     def _remove_selected(self) -> None:
-        for item in self.list.selectedItems():
+        items = self.list.selectedItems()
+        for item in items:
             self.list.takeItem(self.list.row(item))
         self._refresh()
-        self.changed.emit()
+        if items:
+            self.changed.emit()
 
     def _refresh(self) -> None:
         n = self.list.count()
-        self.summary.setText(self._filled_text.format(n=n) if n else self._empty_text)
+        text = self._filled_text.format(n=n) if n else self._empty_text
+        self.summary.setText(text)
+        self.summary.setVisible(bool(text))
+        # 高度随内容变化：显示 2 ~ 5 行，更多时滚动
+        row = self.list.sizeHintForRow(0) if n else self.list.fontMetrics().height() + 4
+        self.list.setFixedHeight(min(max(n, 2), 5) * row + 2 * self.list.frameWidth() + 4)
 
 
 def _resolve_quietly(paths: list[str]) -> list[Path]:

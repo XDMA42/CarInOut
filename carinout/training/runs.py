@@ -77,6 +77,7 @@ def save_run(
     saved = ExperimentConfig.from_dict(cfg.to_dict())
     saved.data.features = list(data.features)
     # 记录实际使用的文件（上级文件夹已展开），以后子文件夹增减也能复现
+    saved.data.datasets = list(data.train_files)
     saved.data.val_datasets, saved.data.test_datasets = list(data.val_files), list(data.test_files)
     spec = get_spec(cfg.model.name)
     saved.model.params = spec.resolve_params(cfg.model.params)

@@ -1,7 +1,10 @@
 {
   "data": {
-    "dataset": "D:/data/merged/1023采集/_dataset.csv",
-    "test_dataset": "",
+    "datasets": [
+      "D:/data/merged/1023采集"
+    ],
+    "val_datasets": [],
+    "test_datasets": [],
     "features": [],
     "label_column": "label",
     "missing": "drop",

@@ -32,7 +32,7 @@ def dataset(tmp_path: Path) -> Path:
 
 def config(dataset: Path, tmp_path: Path, **train) -> ExperimentConfig:
     return ExperimentConfig(
-        data=DataConfig(dataset=str(dataset)),
+        data=DataConfig(datasets=[str(dataset)]),
         model=ModelConfig("mlp", {"hidden_sizes": [16, 8]}),
         train=OptimConfig(**{"epochs": 15, "batch_size": 32, "learning_rate": 0.01, **train}),
         output_dir=str(tmp_path / "runs"),
@@ -245,8 +245,9 @@ def test_config_round_trip_and_validation(tmp_path: Path):
     bad.data.val_datasets = ["D:/data/merged/1024采集"]  # 有独立验证集时验证集比例不生效
     bad.validate()
 
-    # 旧版配置只有一个独立测试集 test_dataset
-    legacy = ExperimentConfig.from_dict({"data": {"test_dataset": "D:/b.csv"}})
+    # 旧版配置的训练数据 dataset、独立测试集 test_dataset 只有一个
+    legacy = ExperimentConfig.from_dict({"data": {"dataset": "D:/a.csv", "test_dataset": "D:/b.csv"}})
+    assert legacy.data.datasets == ["D:/a.csv"]
     assert legacy.data.test_datasets == ["D:/b.csv"] and legacy.data.val_datasets == []
     assert ExperimentConfig.from_dict({"data": {"test_dataset": ""}}).data.test_datasets == []
 
@@ -266,6 +267,16 @@ def test_cli(dataset: Path, tmp_path: Path, capsys):
     saved.save(tmp_path / "c.json")
     assert cli_main(["--config", str(tmp_path / "c.json"), "--epochs", "1", "--name", "again"]) == 0
     assert any(p.name.endswith("_again") for p in out.iterdir())
+
+    # 多个训练数据文件夹
+    for name in ("t1", "t2"):
+        (tmp_path / name).mkdir()
+        make_dataset(tmp_path / name / "_dataset.csv", n_inside=4, n_outside=4, rows_per_point=10, seed=len(name) + 5)
+    multi_out = tmp_path / "multi_runs"
+    assert cli_main(["--dataset", str(tmp_path / "t1"), "--dataset", str(tmp_path / "t2"), "--epochs", "1",
+                     "--output-dir", str(multi_out)]) == 0
+    (run_dir,) = multi_out.iterdir()
+    assert [Path(p).parent.name for p in load_run(run_dir).config.data.datasets] == ["t1", "t2"]
 
     # 多个独立验证集
     for name in ("d1", "d2"):
@@ -296,5 +307,5 @@ def test_dataset_written_by_merger_is_readable(tmp_path: Path):
     df = pd.DataFrame(rows)
     df.loc[3, "rssi_IF"] = None
     df.to_csv(tmp_path / "_dataset.csv", index=False, encoding="utf-8-sig")
-    data = prepare_data(DataConfig(dataset=str(tmp_path / "_dataset.csv")), seed=0)
+    data = prepare_data(DataConfig(datasets=[str(tmp_path / "_dataset.csv")]), seed=0)
     assert data.features == ["rssi_FL", "rssi_IF"]

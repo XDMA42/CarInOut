@@ -29,9 +29,10 @@ DEVICE_CHOICES = ("auto", "cpu", "cuda")
 
 @dataclass
 class DataConfig:
-    dataset: str = ""  # 数据集构建工具导出的总表 _dataset.csv
-    # 可选：独立验证集 / 测试集，可以有多个。每项是含 _dataset.csv 的文件夹、其上级文件夹（取各子文件夹中的
-    # _dataset.csv）或 csv 文件；指定后不再从 dataset 中划分验证集 / 测试集
+    # 训练数据、独立验证集、独立测试集都可以有多个，每项是含 _dataset.csv（数据集构建工具导出的总表）的文件夹、
+    # 其上级文件夹（取各子文件夹中的 _dataset.csv）或 csv 文件。
+    # 指定了独立验证集 / 测试集时，不再从训练数据中划分验证集 / 测试集
+    datasets: list[str] = field(default_factory=list)
     val_datasets: list[str] = field(default_factory=list)
     test_datasets: list[str] = field(default_factory=list)
     features: list[str] = field(default_factory=list)  # 为空时使用全部非常数的数值特征列
@@ -138,13 +139,13 @@ class ExperimentConfig:
 
 
 def _migrate_data(values: dict[str, Any]) -> dict[str, Any]:
-    """旧版本只有一个独立测试集 test_dataset（字符串），转为 test_datasets 列表。"""
-    if "test_dataset" not in values:
-        return values
+    """旧版本的训练数据 dataset、独立测试集 test_dataset 只有一个（字符串），转为列表。"""
     values = dict(values)
-    legacy = values.pop("test_dataset")
-    if legacy and "test_datasets" not in values:
-        values["test_datasets"] = [legacy]
+    for old, new in (("dataset", "datasets"), ("test_dataset", "test_datasets")):
+        if old in values:
+            legacy = values.pop(old)
+            if legacy and new not in values:
+                values[new] = [legacy]
     return values
 
 

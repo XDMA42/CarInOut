@@ -58,10 +58,13 @@ from ..training.data import (
     SPLIT_NAMES,
     FeatureInfo,
     default_features,
+    dataset_name,
     feature_candidates,
     load_table,
     parse_labels,
+    partial_columns,
     prepare_data,
+    resolve_datasets,
 )
 from ..training.metrics import METRIC_NAMES
 from ..training.models import available_models, get_spec
@@ -149,7 +152,7 @@ class TrainWindow(QMainWindow):
 
         self._ready = False  # 界面搭建完成后才同步参数遍历页
         self._infos: list[FeatureInfo] = []
-        self._loaded_dataset = ""  # 特征列表对应的数据集路径
+        self._loaded_datasets: list[str] = []  # 特征列表对应的训练数据
         self._label_column = DataConfig().label_column
         self._param_widgets: dict[str, tuple[ParamSpec, QWidget]] = {}
         self._history: list[dict] = []
@@ -236,38 +239,39 @@ class TrainWindow(QMainWindow):
 
     def _build_data_group(self) -> QWidget:
         box = QGroupBox("数据集")
-        self.dataset_edit = QLineEdit()
-        self.dataset_edit.setPlaceholderText(f"数据集构建工具导出的 {COMBINED_FILENAME}")
-        self.dataset_edit.returnPressed.connect(lambda: self._load_dataset(self.dataset_edit.text().strip()))
-        browse = QPushButton("浏览…")
-        browse.clicked.connect(self._choose_dataset)
-        row = QHBoxLayout()
-        row.addWidget(self.dataset_edit, 1)
-        row.addWidget(browse)
-        self.dataset_info = QLabel("尚未加载数据集")
+        # 训练数据、独立验证集、独立测试集都可以有多个文件夹（每个文件夹一个 _dataset.csv），三者不能重复
+        self.train_list = DatasetList(
+            f"请添加含 {COMBINED_FILENAME} 的文件夹，或其上级文件夹（如 merged）",
+            "",  # 文件夹数、行数等显示在下方的数据概况中
+            self._dataset_browse_dir,
+            lambda: self._excluded_datasets(self.train_list),
+        )
+        self.train_list.changed.connect(lambda: self._load_datasets(self.train_list.paths()))
+        self.dataset_info = QLabel("尚未加载训练数据")
         self.dataset_info.setWordWrap(True)
         self.dataset_info.setStyleSheet("color: gray")
         # 滚动区域中自动换行的标签可能被压成一行，预留两行高度
         self.dataset_info.setMinimumHeight(self.dataset_info.fontMetrics().lineSpacing() * 2 + 2)
+        self.dataset_info.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
 
-        # 独立验证集 / 测试集：如其他几天采集的数据，可以有多个文件夹
         self.val_list = DatasetList(
-            "未指定时按“验证集比例”从上面的数据集中划分",
+            "未指定时按“验证集比例”从训练数据中划分",
             "共 {n} 个文件夹，“验证集比例”不生效",
             self._dataset_browse_dir,
-            lambda: self._excluded_datasets(self.test_list, "已在测试集中"),
+            lambda: self._excluded_datasets(self.val_list),
         )
         self.test_list = DatasetList(
-            "未指定时按“测试集比例”从上面的数据集中划分",
+            "未指定时按“测试集比例”从训练数据中划分",
             "共 {n} 个文件夹，“测试集比例”不生效",
             self._dataset_browse_dir,
-            lambda: self._excluded_datasets(self.val_list, "已在验证集中"),
+            lambda: self._excluded_datasets(self.test_list),
         )
         for widget in (self.val_list, self.test_list):
             widget.changed.connect(self._update_ratio_state)
 
         lay = QVBoxLayout(box)
-        lay.addLayout(row)
+        lay.addWidget(QLabel("训练数据（可多个文件夹）"))
+        lay.addWidget(self.train_list)
         lay.addWidget(self.dataset_info)
         lay.addWidget(QLabel("独立验证集（可选，可多个文件夹）"))
         lay.addWidget(self.val_list)
@@ -509,62 +513,65 @@ class TrainWindow(QMainWindow):
         return edit
 
     # ------------------------------------------------------------------ 数据集与特征
-    def _choose_dataset(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择数据集", self.dataset_edit.text() or str(PROJECT_ROOT), "CSV 文件 (*.csv);;所有文件 (*)"
-        )
-        if path:
-            self.dataset_edit.setText(path)
-            self._load_dataset(path)
-
-    def _excluded_datasets(self, other: DatasetList, reason: str) -> dict[str, str]:
-        """不能加入独立验证集 / 测试集的数据：训练数据本身，以及已在另一个列表中的文件夹。"""
-        excluded = {path: reason for path in other.paths()}
-        if self.dataset_edit.text().strip():
-            excluded[self.dataset_edit.text().strip()] = "训练数据"
-        return excluded
+    def _excluded_datasets(self, target: DatasetList) -> dict[str, str]:
+        """不能加入 target 的数据：已在另外两个列表（训练数据 / 验证集 / 测试集）中的文件夹。"""
+        lists = {"训练数据": self.train_list, "验证集": self.val_list, "测试集": self.test_list}
+        return {path: f"已在{name}中" for name, w in lists.items() if w is not target for path in w.paths()}
 
     def _dataset_browse_dir(self) -> str:
-        """选择独立验证集 / 测试集时的起始位置：训练数据所在文件夹的上一级（通常是 merged）。"""
-        dataset = self.dataset_edit.text().strip()
-        return str(Path(dataset).parent.parent) if dataset else str(PROJECT_ROOT)
+        """选择文件夹时的起始位置：第一个训练数据文件夹的上一级（通常是 merged）。"""
+        paths = self.train_list.paths()
+        if not paths:
+            return str(PROJECT_ROOT)
+        first = Path(paths[0])
+        return str((first.parent if first.suffix.lower() == ".csv" else first).parent)
 
-    def _load_dataset(self, path: str, keep: list[str] | None = None) -> None:
-        """读取数据集并列出候选特征。keep 为要勾选的特征（来自配置），为 None 时沿用当前勾选或使用默认。"""
-        if keep is None and self._loaded_dataset:
+    def _load_datasets(self, paths: list[str], keep: list[str] | None = None) -> None:
+        """读取训练数据并列出候选特征（各文件夹都有的数值列）。
+        keep 为要勾选的特征（来自配置），为 None 时沿用当前勾选或使用默认。"""
+        if keep is None and self._loaded_datasets:
             keep = self._checked_features()
-        self._infos, self._loaded_dataset = [], ""
-        if not path:
+        self._infos, self._loaded_datasets = [], []
+        if not paths:
             self._populate_features([])
-            self.dataset_info.setText("尚未加载数据集")
+            self.dataset_info.setText("尚未加载训练数据")
             return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            df = load_table(path)
-            infos = feature_candidates(df, self._label_column)
-            labels = parse_labels(df, self._label_column)
+            files = resolve_datasets(paths)
+            tables = [load_table(f) for f in files]
+            infos = feature_candidates(tables, self._label_column)
+            labels = pd.concat([parse_labels(t, self._label_column) for t in tables], ignore_index=True)
         except ValueError as exc:
             self._populate_features([])
             self.dataset_info.setText(f"加载失败：{exc}")
-            self._log(f"加载数据集失败：{exc}")
+            self._log(f"加载训练数据失败：{exc}")
             return
         finally:
             QApplication.restoreOverrideCursor()
-        self._infos, self._loaded_dataset = infos, path
+        self._infos, self._loaded_datasets = infos, list(paths)
         counts = labels.value_counts()
-        parts = [f"{len(df):,} 行", "，".join(f"{CLASS_NAMES[c]} {int(counts.get(c, 0)):,}" for c in CLASS_NAMES)]
-        if {SCENE_COLUMN, POINT_COLUMN} <= set(df.columns):
-            n_points = len(df.groupby([SCENE_COLUMN, POINT_COLUMN]))
-            parts.append(f"{df[SCENE_COLUMN].nunique()} 个场景，{n_points} 个点位")
+        rows = f"{len(labels):,} 行"
+        parts = [
+            f"{len(files)} 个文件夹，{rows}" if len(files) > 1 else rows,
+            "，".join(f"{CLASS_NAMES[c]} {int(counts.get(c, 0)):,}" for c in CLASS_NAMES),
+        ]
+        if all({SCENE_COLUMN, POINT_COLUMN} <= set(t.columns) for t in tables):
+            meta = pd.concat([t[[SCENE_COLUMN, POINT_COLUMN]] for t in tables], ignore_index=True)
+            points = meta.groupby([SCENE_COLUMN, POINT_COLUMN]).ngroups  # 与数据划分一致：同名点位算同一位置
+            parts.append(f"{meta[SCENE_COLUMN].nunique()} 个场景，{points} 个点位")
         parts.append(f"{len(infos)} 个数值特征列")
         self.dataset_info.setText("；".join(parts))
-        self._log(f"加载数据集：{path}（{'；'.join(parts)}）")
+        self._log(f"加载训练数据：{'、'.join(dataset_name(f) for f in files)}（{'；'.join(parts)}）")
+        partial = partial_columns(tables, self._label_column)
+        if partial:
+            self._log(f"  以下列不是每个文件夹都有，不作为候选特征：{'、'.join(partial)}")
 
         names = [i.name for i in infos]
         if keep:
             absent = [f for f in keep if f not in names]
             if absent:
-                self._log(f"  配置中的特征在该数据集中不存在，已忽略：{'、'.join(absent)}")
+                self._log(f"  配置中的特征在训练数据中不存在，已忽略：{'、'.join(absent)}")
             keep = [f for f in keep if f in names]
         self._populate_features(keep or default_features(infos))
 
@@ -705,7 +712,7 @@ class TrainWindow(QMainWindow):
 
         cfg = ExperimentConfig(
             data=DataConfig(
-                dataset=self.dataset_edit.text().strip(),
+                datasets=self.train_list.paths(),
                 val_datasets=self.val_list.paths(),
                 test_datasets=self.test_list.paths(),
                 features=self._checked_features(),
@@ -766,9 +773,9 @@ class TrainWindow(QMainWindow):
         spec = self._current_spec()
         self._build_param_form(spec, cfg.model.params if spec.name == cfg.model.name else None)
 
-        self.dataset_edit.setText(d.dataset)
-        self._loaded_dataset = ""
-        self._load_dataset(d.dataset, list(d.features))
+        self.train_list.set_paths(d.datasets)
+        self._loaded_datasets = []
+        self._load_datasets(d.datasets, list(d.features))
         self._update_fill_state()
         self._update_ratio_state()
 
@@ -806,7 +813,7 @@ class TrainWindow(QMainWindow):
             base = Path(tool.last_output_dir) if tool.last_output_dir else None
             candidate = dataset_folder(Path(tool.last_input_dir), base) / COMBINED_FILENAME
             if candidate.is_file():
-                cfg.data.dataset = str(candidate)
+                cfg.data.datasets = [str(candidate.parent)]
         return cfg, {}
 
     def _save_state(self) -> None:
@@ -867,11 +874,11 @@ class TrainWindow(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self, "配置有误", str(exc))
             return None
-        if not cfg.data.dataset:
-            QMessageBox.warning(self, "提示", "请先选择数据集")
+        if not cfg.data.datasets:
+            QMessageBox.warning(self, "提示", "请先添加训练数据")
             return None
-        if cfg.data.dataset != self._loaded_dataset:
-            self._load_dataset(cfg.data.dataset)
+        if cfg.data.datasets != self._loaded_datasets:
+            self._load_datasets(cfg.data.datasets)
             cfg.data.features = self._checked_features()
         if not cfg.data.features:
             QMessageBox.warning(self, "提示", "请至少勾选一个输入特征")
