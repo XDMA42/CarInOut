@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .parser import DEFAULT_PATTERN, LEGACY_DEFAULT_PATTERNS
@@ -68,6 +68,8 @@ class AppConfig:
     filename_pattern: str
     last_input_dir: str = ""
     last_output_dir: str = ""
+    # 场景 → 标签（0 车外 / 1 车内）；未出现的场景视为未标注
+    scene_labels: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Path | None = None) -> "AppConfig":
@@ -98,6 +100,11 @@ class AppConfig:
             filename_pattern=pattern,
             last_input_dir=data.get("last_input_dir", ""),
             last_output_dir=data.get("last_output_dir", ""),
+            scene_labels={
+                scene: label
+                for scene, label in (data.get("scene_labels") or {}).items()
+                if type(label) is int and label in (0, 1)
+            },
         )
 
     def save(self, path: Path | None = None) -> None:
@@ -109,5 +116,6 @@ class AppConfig:
             "filename_pattern": "" if self.filename_pattern == DEFAULT_PATTERN else self.filename_pattern,
             "last_input_dir": self.last_input_dir,
             "last_output_dir": self.last_output_dir,
+            "scene_labels": self.scene_labels,
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

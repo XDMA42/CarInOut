@@ -65,3 +65,17 @@ def test_legacy_default_pattern_in_config_is_upgraded(tmp_path: Path):
     custom = r"^(?P<scene>.+)_(?P<point>\d+)_(?P<anchor>\w+)\.csv$"
     cfg.write_text(json.dumps({"filename_pattern": custom}), encoding="utf-8")
     assert AppConfig.load(cfg).filename_pattern == custom
+
+
+def test_scene_labels_roundtrip(tmp_path: Path):
+    import json
+
+    from carinout.anchors import AppConfig
+
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"scene_labels": {"座椅": 1, "车外": 0, "坏值": 2, "布尔": True}}), encoding="utf-8")
+    config = AppConfig.load(cfg)
+    assert config.scene_labels == {"座椅": 1, "车外": 0}
+    config.scene_labels["脚坑"] = 1
+    config.save(cfg)
+    assert AppConfig.load(cfg).scene_labels == {"座椅": 1, "车外": 0, "脚坑": 1}
