@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal
@@ -140,7 +141,8 @@ class MainWindow(QMainWindow):
         self.pattern_edit = QLineEdit(self.config.filename_pattern)
         self.pattern_edit.setToolTip(
             "文件名正则，需包含命名分组 scene（场景）、point（点位）、anchor（锚点/SLAVE），不区分大小写。\n"
-            "默认规则可解析 “中排座椅_53_SLAVE2.csv”。"
+            "默认规则可解析 “中间座椅+脚坑-68-[COM261][SLAVE4] 2026-10-23 15-44-12.743.csv”\n"
+            "（锚点取方括号内容，跳过 [COMxxx]）和 “中排座椅_53_SLAVE2.csv”。"
         )
         reset = QPushButton("默认")
         reset.setToolTip("恢复默认文件名规则")
@@ -192,8 +194,12 @@ class MainWindow(QMainWindow):
         hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.currentCellChanged.connect(self._on_table_row)
 
-        auto = QPushButton("按顺序分配")
-        auto.setToolTip("SLAVE 按编号依次对应车模上的锚点顺序：" + " → ".join(s.description for s in ANCHOR_SLOTS))
+        auto = QPushButton("按编号分配")
+        auto.setToolTip(
+            "按 ID 末尾的编号对应车模上的锚点顺序（编号 1 → "
+            + " → ".join(s.description for s in ANCHOR_SLOTS)
+            + "），没有编号的 ID（如 MASTER_MCU）不分配"
+        )
         auto.clicked.connect(self._auto_assign)
         clear = QPushButton("清空映射")
         clear.clicked.connect(self._clear_mapping)
@@ -429,13 +435,18 @@ class MainWindow(QMainWindow):
         if not self.slaves:
             return
         if any(self.config.slave_mapping.get(s) for s in self.slaves):
-            ok = QMessageBox.question(self, "按顺序分配", "将覆盖当前的映射，是否继续？")
+            ok = QMessageBox.question(self, "按编号分配", "将覆盖当前的映射，是否继续？")
             if ok != QMessageBox.StandardButton.Yes:
                 return
-        for slave, key in zip(self.slaves, SLOT_KEYS):
-            self.config.slave_mapping[slave] = key
-        for slave in self.slaves[len(SLOT_KEYS):]:
-            self.config.slave_mapping.pop(slave, None)
+        taken: set[int] = set()
+        for slave in self.slaves:
+            m = re.search(r"(\d+)$", slave)
+            n = int(m.group(1)) if m else 0
+            if 1 <= n <= len(SLOT_KEYS) and n not in taken:
+                self.config.slave_mapping[slave] = SLOT_KEYS[n - 1]
+                taken.add(n)
+            else:
+                self.config.slave_mapping.pop(slave, None)
         self._sync_combos()
 
     def _clear_mapping(self) -> None:

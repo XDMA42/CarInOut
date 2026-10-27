@@ -10,7 +10,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from .parser import DEFAULT_PATTERN
+from .parser import DEFAULT_PATTERN, LEGACY_DEFAULT_PATTERNS
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 
@@ -89,10 +89,13 @@ class AppConfig:
             for slave, key in (data.get("slave_mapping") or {}).items()
             if key in names
         }
+        pattern = data.get("filename_pattern") or DEFAULT_PATTERN
+        if pattern in LEGACY_DEFAULT_PATTERNS:
+            pattern = DEFAULT_PATTERN
         return cls(
             anchor_names=names,
             slave_mapping=mapping,
-            filename_pattern=data.get("filename_pattern") or DEFAULT_PATTERN,
+            filename_pattern=pattern,
             last_input_dir=data.get("last_input_dir", ""),
             last_output_dir=data.get("last_output_dir", ""),
         )
@@ -102,7 +105,8 @@ class AppConfig:
         payload = {
             "anchor_names": self.anchor_names,
             "slave_mapping": self.slave_mapping,
-            "filename_pattern": self.filename_pattern,
+            # 使用默认规则时不写入，以后默认规则更新能直接生效
+            "filename_pattern": "" if self.filename_pattern == DEFAULT_PATTERN else self.filename_pattern,
             "last_input_dir": self.last_input_dir,
             "last_output_dir": self.last_output_dir,
         }

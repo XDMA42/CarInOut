@@ -15,6 +15,12 @@ REGEX = compile_pattern(DEFAULT_PATTERN)
         ("中排座椅_53_SLAVE2_20240501.csv", ("中排座椅", "53", "SLAVE2")),
         ("车外_左侧_101_SLAVE7.csv", ("车外_左侧", "101", "SLAVE7")),
         ("中排座椅-53-SLAVE2.csv", ("中排座椅", "53", "SLAVE2")),
+        ("中间座椅+脚坑-68-[COM261][SLAVE4] 2026-10-23 15-44-12.743.csv", ("中间座椅+脚坑", "68", "SLAVE4")),
+        ("中间座椅+脚坑-69-[COM263][SLAVE3] 2026-10-23 15-53-32.871.csv", ("中间座椅+脚坑", "69", "SLAVE3")),
+        ("中间座椅+脚坑-68-[COM266][master_mcu] 2026-10-23 15-44-12.772.csv", ("中间座椅+脚坑", "68", "MASTER_MCU")),
+        ("中间座椅+脚坑-68-[COM267][SLVAE5] 2026-10-23 15-44-12.770.csv", ("中间座椅+脚坑", "68", "SLVAE5")),
+        ("车外-左侧-101-[COM261][SLAVE1] 2026-10-23 15-44-12.743.csv", ("车外-左侧", "101", "SLAVE1")),
+        ("中间座椅-68-[SLAVE4].csv", ("中间座椅", "68", "SLAVE4")),
     ],
 )
 def test_parse_filename(name, expected):
@@ -41,3 +47,21 @@ def test_scan_and_group(tmp_path: Path):
     groups = group_by_point(parsed)
     assert list(groups) == [("A", "2"), ("A", "10"), ("B", "1")]
     assert list(groups[("A", "2")]) == ["SLAVE1", "SLAVE2", "SLAVE10"]
+
+
+def test_legacy_default_pattern_in_config_is_upgraded(tmp_path: Path):
+    import json
+
+    from carinout.anchors import AppConfig
+    from carinout.parser import LEGACY_DEFAULT_PATTERNS
+
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"filename_pattern": LEGACY_DEFAULT_PATTERNS[0]}), encoding="utf-8")
+    config = AppConfig.load(cfg)
+    assert config.filename_pattern == DEFAULT_PATTERN
+    config.save(cfg)
+    assert json.loads(cfg.read_text(encoding="utf-8"))["filename_pattern"] == ""
+
+    custom = r"^(?P<scene>.+)_(?P<point>\d+)_(?P<anchor>\w+)\.csv$"
+    cfg.write_text(json.dumps({"filename_pattern": custom}), encoding="utf-8")
+    assert AppConfig.load(cfg).filename_pattern == custom
