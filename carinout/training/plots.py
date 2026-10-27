@@ -118,6 +118,54 @@ def draw_evaluation(fig: Figure, scores: dict[str, tuple[np.ndarray, np.ndarray]
     _roc(axes[2], scores)
 
 
+def draw_sweep(
+    fig: Figure,
+    results: pd.DataFrame,
+    axes: list[tuple[str, str]],
+    metric: str,
+    metric_label: str,
+    lower_is_better: bool = False,
+) -> None:
+    """参数遍历结果：每个有多个取值的参数一张子图，横轴为取值，点为各组合的指标，折线为同一取值下的平均。"""
+    fig.clear()
+    shown = [(key, label) for key, label in axes if key in results and results[key].nunique() > 1]
+    finished = results[results[metric].notna()] if metric in results else pd.DataFrame()
+    if not shown or finished.empty:
+        ax = fig.subplots()
+        _style(ax, f"各参数对{metric_label}的影响")
+        _placeholder(ax, "等待结果…" if shown else "填写多个取值的参数会在这里对比")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        return
+    cols = len(shown) if len(shown) <= 4 else 3
+    grid = fig.subplots((len(shown) + cols - 1) // cols, cols, sharey=True, squeeze=False)
+    rng = np.random.default_rng(0)
+    jitter = pd.Series((rng.random(len(finished)) - 0.5) * 0.18, index=finished.index)  # 同一取值的点左右错开
+    ranked = finished.sort_values(metric, ascending=lower_is_better, kind="stable")
+    best = ranked.index[0]
+    for ax, (key, label) in zip(grid.flat, shown):
+        values = sorted(results[key].dropna().unique())
+        position = {v: i for i, v in enumerate(values)}
+        x = finished[key].map(position) + jitter
+        _style(ax, label)
+        ax.scatter(x, finished[metric], s=36, color=SERIES[0], edgecolors=SURFACE, linewidths=1.5, zorder=3,
+                   label="各组合")
+        means = finished.groupby(key)[metric].mean().reindex(values)
+        ax.plot(range(len(values)), means.to_numpy(), color=INK_2, lw=1.2, marker="o", markersize=4, zorder=2,
+                label="平均")
+        ax.scatter([x[best]], [finished.at[best, metric]], s=80, color=SERIES[1], edgecolors=SURFACE, linewidths=2,
+                   zorder=4, label="最佳组合")
+        ax.set_xticks(range(len(values)), [f"{v:g}" if isinstance(v, float) else str(v) for v in values])
+        ax.set_xlim(-0.5, len(values) - 0.5)
+    for ax in list(grid.flat)[len(shown):]:
+        ax.set_visible(False)
+    for row in grid:
+        row[0].set_ylabel(metric_label + ("（越低越好）" if lower_is_better else ""), color=MUTED, fontsize=8)
+    handles, labels = grid[0][0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="outside upper right", ncols=3, frameon=False, fontsize=8, labelcolor=INK_2,
+               handlelength=1.2)
+
+
 def save_figures(run_dir: Path, history: pd.DataFrame, best_epoch: int, scores: dict) -> None:
     for filename, size, draw in (
         ("loss.png", (13, 3.8), lambda f: draw_losses(f, history, best_epoch)),

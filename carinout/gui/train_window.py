@@ -76,7 +76,9 @@ from ..training.runs import (
     save_run_figures,
     split_scores,
 )
+from ..training.sweep import is_sweep_dir, load_sweep
 from ..training.trainer import HISTORY_COLUMNS, fit
+from .sweep_panel import SweepPanel
 from .train_charts import EpochChart, EvaluationChart
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -144,6 +146,7 @@ class TrainWindow(QMainWindow):
         self.setWindowTitle("钥匙车内外识别 · 模型训练")
         self.resize(1560, 960)
 
+        self._ready = False  # 界面搭建完成后才同步参数遍历页
         self._infos: list[FeatureInfo] = []
         self._loaded_dataset = ""  # 特征列表对应的数据集路径
         self._label_column = DataConfig().label_column
@@ -180,7 +183,10 @@ class TrainWindow(QMainWindow):
         self.setCentralWidget(container)
         self.statusBar()
 
-        self._apply_config(self._load_state())
+        self._ready = True
+        cfg, sweep_state = self._load_state()
+        self._apply_config(cfg)
+        self.sweep_panel.restore(sweep_state)
 
     # ------------------------------------------------------------------ 界面搭建
     def _build_config_panel(self) -> QWidget:
@@ -211,7 +217,7 @@ class TrainWindow(QMainWindow):
         save_cfg.setToolTip("保存为 JSON，可用于命令行训练：python train.py --config 文件名")
         save_cfg.clicked.connect(self._save_config_file)
         open_run = QPushButton("打开训练结果…")
-        open_run.setToolTip("查看以前某次训练的曲线和评估结果，并把它的配置载入左侧")
+        open_run.setToolTip("查看以前某次训练（或参数遍历）的结果，并把它的配置载入左侧")
         open_run.clicked.connect(self._open_run_dialog)
         brow = QHBoxLayout()
         brow.addWidget(load_cfg)
@@ -377,6 +383,10 @@ class TrainWindow(QMainWindow):
         self.device_combo.addItem("CPU", "cpu")
         self.device_combo.addItem("CUDA GPU", "cuda")
 
+        for signal in (self.batch_spin.valueChanged, self.lr_edit.textChanged, self.epochs_spin.valueChanged,
+                       self.l2_edit.textChanged):
+            signal.connect(self._refresh_sweep_axes)
+
         form = QFormLayout(box)
         form.addRow("batch size", self.batch_spin)
         form.addRow("learning rate", self.lr_edit)
@@ -417,6 +427,13 @@ class TrainWindow(QMainWindow):
 
         self.history_table = self._table([HISTORY_HEADERS[c] for c in HISTORY_COLUMNS])
         self.tabs.addTab(self.history_table, "训练记录")
+
+        self.sweep_panel = SweepPanel(self._checked_config)
+        self.sweep_panel.runningChanged.connect(self._on_sweep_running)
+        self.sweep_panel.showRunRequested.connect(self._show_run_dir)
+        self.sweep_panel.applyConfigRequested.connect(self._apply_sweep_config)
+        self.sweep_panel.message.connect(self._log)
+        self.tabs.addTab(self.sweep_panel, "参数遍历")
         return self.tabs
 
     def _build_eval_tab(self) -> QWidget:
@@ -651,6 +668,17 @@ class TrainWindow(QMainWindow):
             return
         self.structure_label.setStyleSheet("color: gray")
         self.structure_label.setText(("结构：" + text) if n_features else "请先选择输入特征")
+        self._refresh_sweep_axes()
+
+    def _refresh_sweep_axes(self, *_args) -> None:
+        """模型或隐藏层数变化时，参数遍历页的可选参数随之变化。"""
+        if not self._ready:
+            return
+        try:
+            cfg = self._collect_config()
+        except ValueError:
+            return
+        self.sweep_panel.refresh_axes(cfg)
 
     # ------------------------------------------------------------------ 配置 ↔ 界面
     def _collect_config(self) -> ExperimentConfig:
@@ -743,15 +771,17 @@ class TrainWindow(QMainWindow):
         self.test_spin.setEnabled(not has_test)
         self.test_spin.setToolTip("已指定独立测试集，此项不生效" if has_test else "从数据集中划出的测试集比例")
 
-    def _load_state(self) -> ExperimentConfig:
+    def _load_state(self) -> tuple[ExperimentConfig, dict]:
+        """返回 (训练配置, 参数遍历页的设置)。"""
         cfg = ExperimentConfig(output_dir=str(PROJECT_ROOT / "runs"))
         if STATE_PATH.exists():
             try:
                 state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-                return ExperimentConfig.from_dict(state.get("config", {}))
+                sweep = state.get("sweep")
+                return ExperimentConfig.from_dict(state.get("config", {})), sweep if isinstance(sweep, dict) else {}
             except (OSError, ValueError, AttributeError) as exc:
                 self._log(f"上次的训练配置无法读取，使用默认配置：{exc}")
-                return cfg
+                return cfg, {}
         # 第一次打开：尝试使用数据集构建工具上次导出的总表
         tool = AppConfig.load()
         if tool.last_input_dir:
@@ -759,7 +789,7 @@ class TrainWindow(QMainWindow):
             candidate = dataset_folder(Path(tool.last_input_dir), base) / COMBINED_FILENAME
             if candidate.is_file():
                 cfg.data.dataset = str(candidate)
-        return cfg
+        return cfg, {}
 
     def _save_state(self) -> None:
         try:
@@ -768,7 +798,8 @@ class TrainWindow(QMainWindow):
             return
         try:
             STATE_PATH.write_text(
-                json.dumps({"config": cfg.to_dict()}, ensure_ascii=False, indent=2), encoding="utf-8"
+                json.dumps({"config": cfg.to_dict(), "sweep": self.sweep_panel.state()}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
             )
         except OSError as exc:
             self.statusBar().showMessage(f"配置保存失败：{exc}", 5000)
@@ -811,22 +842,29 @@ class TrainWindow(QMainWindow):
             return
         self._start_training()
 
-    def _start_training(self) -> None:
+    def _checked_config(self) -> ExperimentConfig | None:
+        """读取左侧配置并做训练前检查；有问题时提示并返回 None。单次训练和参数遍历共用。"""
         try:
             cfg = self._collect_config()
         except ValueError as exc:
             QMessageBox.warning(self, "配置有误", str(exc))
-            return
+            return None
         if not cfg.data.dataset:
             QMessageBox.warning(self, "提示", "请先选择数据集")
-            return
+            return None
         if cfg.data.dataset != self._loaded_dataset:
             self._load_dataset(cfg.data.dataset)
             cfg.data.features = self._checked_features()
         if not cfg.data.features:
             QMessageBox.warning(self, "提示", "请至少勾选一个输入特征")
-            return
+            return None
         self._save_state()
+        return cfg
+
+    def _start_training(self) -> None:
+        cfg = self._checked_config()
+        if cfg is None:
+            return
 
         self._history = []
         self._run = None
@@ -847,6 +885,7 @@ class TrainWindow(QMainWindow):
         self._worker = TrainWorker(cfg)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
+        self.sweep_panel.set_busy(True)
         self._worker.epoch.connect(self._on_epoch)
         self._worker.message.connect(self._log)
         self._worker.done.connect(self._on_finished)
@@ -885,6 +924,12 @@ class TrainWindow(QMainWindow):
         self._worker = None
         self.start_btn.setText("开始训练")
         self.start_btn.setEnabled(True)
+        self.sweep_panel.set_busy(False)
+
+    def _on_sweep_running(self, running: bool) -> None:
+        """参数遍历进行中时不能同时单独训练。"""
+        self.start_btn.setEnabled(not running)
+        self.start_btn.setToolTip("参数遍历进行中" if running else "")
 
     def _on_finished(self, run_dir: Path) -> None:
         self._cleanup_worker()
@@ -906,8 +951,19 @@ class TrainWindow(QMainWindow):
     # ------------------------------------------------------------------ 结果展示
     def _open_run_dialog(self) -> None:
         start = self.output_edit.text() or str(PROJECT_ROOT / "runs")
-        folder = QFileDialog.getExistingDirectory(self, "选择训练结果文件夹", start)
+        folder = QFileDialog.getExistingDirectory(self, "选择训练结果或参数遍历结果文件夹", start)
         if not folder:
+            return
+        if is_sweep_dir(folder):
+            try:
+                record = load_sweep(folder)
+            except (OSError, ValueError) as exc:
+                QMessageBox.warning(self, "打开失败", str(exc))
+                return
+            self._apply_config(record.base)
+            self.sweep_panel.show_sweep(record)
+            self.tabs.setCurrentWidget(self.sweep_panel)
+            self._log(f"已打开参数遍历结果：{folder}（基础配置已载入左侧）")
             return
         try:
             run = load_run(folder)
@@ -917,6 +973,21 @@ class TrainWindow(QMainWindow):
         self._apply_config(run.config)
         self._show_run(run)
         self._log(f"已打开训练结果：{folder}（其配置已载入左侧）")
+
+    def _show_run_dir(self, path: Path) -> None:
+        """参数遍历页中查看某个组合：在损失曲线、评价指标、评估结果、训练记录页显示它。"""
+        try:
+            run = load_run(path)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "打开失败", str(exc))
+            return
+        self._show_run(run)
+        self.tabs.setCurrentWidget(self.loss_chart)
+        self._log(f"查看组合：{path}")
+
+    def _apply_sweep_config(self, cfg: ExperimentConfig) -> None:
+        self._apply_config(cfg)
+        self._log("已把参数组合载入左侧配置")
 
     def _show_run(self, run: RunRecord) -> None:
         self._run = run
@@ -1009,6 +1080,7 @@ class TrainWindow(QMainWindow):
         if self._worker is not None:
             self._worker.stop()
             self._cleanup_worker()
+        self.sweep_panel.shutdown()
         self._save_state()
         super().closeEvent(event)
 

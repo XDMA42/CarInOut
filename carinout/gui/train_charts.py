@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import numpy as np
+import pandas as pd
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from PySide6.QtWidgets import QVBoxLayout, QWidget
 
@@ -102,4 +103,14 @@ class EvaluationChart(_ChartBase):
 
     def update_scores(self, scores: dict) -> None:
         plots.draw_evaluation(self.figure, scores)
+        self.canvas.draw_idle()
+
+
+class SweepChart(_ChartBase):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(12, 3.6, parent)
+        self.update_results(None, [], "val_accuracy", "验证集准确率")
+
+    def update_results(self, results, axes: list[tuple[str, str]], metric: str, label: str, lower=False) -> None:
+        plots.draw_sweep(self.figure, results if results is not None else pd.DataFrame(), axes, metric, label, lower)
         self.canvas.draw_idle()

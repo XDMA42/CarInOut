@@ -45,6 +45,7 @@ SPEC = ModelSpec(
             help="逗号分隔，每个数字是一层隐藏层的节点数。\n"
             "“64, 32” 即 输入 → 64 → 32 → 输出，共 3 层全连接（两层隐藏层 + 输出层）。",
             minimum=1,
+            short="h",
         ),
     ),
     factory=lambda in_features, num_classes, hidden_sizes: MLP(in_features, num_classes, hidden_sizes),
