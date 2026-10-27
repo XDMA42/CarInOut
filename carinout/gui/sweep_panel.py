@@ -315,8 +315,8 @@ class SweepPanel(QWidget):
             questions.append("没有填写多个取值，只会训练 1 组。")
         if len(trials) > CONFIRM_TRIALS:
             questions.append(f"共 {len(trials)} 组，可能需要很长时间。")
-        if base.data.val_ratio == 0:
-            questions.append("验证集比例为 0，无法按验证集指标比较各组合。")
+        if base.data.val_ratio == 0 and not base.data.val_datasets:
+            questions.append("验证集比例为 0 且没有独立验证集，无法按验证集指标比较各组合。")
         if questions:
             ok = QMessageBox.question(self, "开始遍历", "\n".join(questions) + "\n是否继续？")
             if ok != QMessageBox.StandardButton.Yes:

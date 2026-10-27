@@ -140,11 +140,19 @@ def test_stop_and_failure(base: ExperimentConfig):
 
 def test_cli_sweep(base: ExperimentConfig, tmp_path: Path, capsys):
     out = tmp_path / "cli"
+    val = tmp_path / "val_day"
+    val.mkdir()
+    make_dataset(val / "_dataset.csv", n_inside=3, n_outside=3, rows_per_point=10, seed=9)
     args = ["--dataset", base.data.dataset, "--epochs", "2", "--hidden", "8,4", "--output-dir", str(out),
-            "--sweep", "lr=0.01,0.001", "--sweep", "hidden2=2,4", "--workers", "2", "--rank-by", "val_auc"]
+            "--sweep", "lr=0.01,0.001", "--sweep", "hidden2=2,4", "--workers", "2", "--rank-by", "val_auc",
+            "--val-dataset", str(val)]
     assert cli_main(args) == 0
     (path,) = out.iterdir()
-    results = load_sweep(path).results
+    record = load_sweep(path)
+    assert record.base.data.val_datasets == [str(val / "_dataset.csv")]  # 记录实际使用的文件
+    results = record.results
+    assert results["val_auc"].notna().all()
+    assert load_run(path / results["name"].iloc[0]).predictions.query("split == 'val'")["source"].eq("val_day").all()
     assert sorted(zip(results["train.learning_rate"], results["model.hidden_sizes[1]"])) == [
         (0.001, 2), (0.001, 4), (0.01, 2), (0.01, 4)]
     assert "按验证集 AUC排序" in capsys.readouterr().out

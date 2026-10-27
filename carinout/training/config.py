@@ -30,15 +30,18 @@ DEVICE_CHOICES = ("auto", "cpu", "cuda")
 @dataclass
 class DataConfig:
     dataset: str = ""  # 数据集构建工具导出的总表 _dataset.csv
-    test_dataset: str = ""  # 可选：独立测试集（如另一天采集的总表）；为空时从 dataset 中划分
+    # 可选：独立验证集 / 测试集，可以有多个。每项是含 _dataset.csv 的文件夹、其上级文件夹（取各子文件夹中的
+    # _dataset.csv）或 csv 文件；指定后不再从 dataset 中划分验证集 / 测试集
+    val_datasets: list[str] = field(default_factory=list)
+    test_datasets: list[str] = field(default_factory=list)
     features: list[str] = field(default_factory=list)  # 为空时使用全部非常数的数值特征列
     label_column: str = LABEL_COLUMN
     missing: str = MISSING_DROP
     fill_value: float = 0.0  # missing == constant 时使用
     standardize: bool = True  # 按训练集的均值、标准差做 z-score 标准化
     split: str = SPLIT_POINT
-    val_ratio: float = 0.2
-    test_ratio: float = 0.1  # 指定了 test_dataset 时忽略
+    val_ratio: float = 0.2  # 指定了 val_datasets 时忽略
+    test_ratio: float = 0.1  # 指定了 test_datasets 时忽略
 
 
 @dataclass
@@ -78,7 +81,7 @@ class ExperimentConfig:
             errors.append(f"data.split 应为 {'/'.join(SPLIT_CHOICES)}")
         if not 0 <= d.val_ratio < 1 or not 0 <= d.test_ratio < 1:
             errors.append("验证集、测试集比例应在 0 ~ 1 之间")
-        elif d.val_ratio + (0 if d.test_dataset else d.test_ratio) >= 1:
+        elif (0 if d.val_datasets else d.val_ratio) + (0 if d.test_datasets else d.test_ratio) >= 1:
             errors.append("验证集与测试集比例之和应小于 1，训练集才有数据")
         if t.batch_size < 1:
             errors.append("batch size 至少为 1")
@@ -111,6 +114,8 @@ class ExperimentConfig:
             if key in sections:
                 if not isinstance(value, dict):
                     raise ValueError(f"配置项 {key} 应为对象")
+                if key == "data":
+                    value = _migrate_data(value)
                 kwargs[key] = _build_section(sections[key], value, key)
             elif key in ("output_dir", "run_name"):
                 kwargs[key] = str(value)
@@ -130,6 +135,17 @@ class ExperimentConfig:
         if not isinstance(data, dict):
             raise ValueError("配置文件应为 JSON 对象")
         return cls.from_dict(data)
+
+
+def _migrate_data(values: dict[str, Any]) -> dict[str, Any]:
+    """旧版本只有一个独立测试集 test_dataset（字符串），转为 test_datasets 列表。"""
+    if "test_dataset" not in values:
+        return values
+    values = dict(values)
+    legacy = values.pop("test_dataset")
+    if legacy and "test_datasets" not in values:
+        values["test_datasets"] = [legacy]
+    return values
 
 
 def _build_section(cls, values: dict[str, Any], prefix: str):

@@ -4,7 +4,7 @@
   config.json       完整配置（features 为实际使用的特征），可直接加载后复现
   history.csv       每个 epoch 的损失与验证集指标
   metrics.json      最佳模型在训练 / 验证 / 测试集上的指标与混淆矩阵
-  predictions.csv   每个样本的 split、scene、point、ts、label、车内概率 prob、预测 pred
+  predictions.csv   每个样本的 split、source（来自哪个文件夹）、ts、scene、point、label、车内概率 prob、预测 pred
   model.pt          模型参数 + 特征列表 + 缺失值填充值 + 标准化参数（Predictor 加载）
   loss.png / metrics.png / evaluation.png
 """
@@ -24,7 +24,8 @@ import torch
 
 from ..merger import POINT_COLUMN, SCENE_COLUMN
 from .config import ExperimentConfig
-from .data import META_COLUMNS, NUM_CLASSES, SPLITS, PreparedData, to_numeric
+from .data import META_COLUMNS, NUM_CLASSES, SOURCE_COLUMN, SPLITS, PreparedData, to_numeric
+from .metrics import binary_metrics
 from .models import get_spec
 from .trainer import HISTORY_COLUMNS, TrainResult
 
@@ -75,6 +76,8 @@ def save_run(
     run_dir = Path(run_dir)
     saved = ExperimentConfig.from_dict(cfg.to_dict())
     saved.data.features = list(data.features)
+    # 记录实际使用的文件（上级文件夹已展开），以后子文件夹增减也能复现
+    saved.data.val_datasets, saved.data.test_datasets = list(data.val_files), list(data.test_files)
     spec = get_spec(cfg.model.name)
     saved.model.params = spec.resolve_params(cfg.model.params)
     saved.save(run_dir / CONFIG_FILE)
@@ -93,6 +96,7 @@ def save_run(
         "num_parameters": result.num_parameters,
         "features": list(data.features),
         "splits": {name: {"loss": ev.loss, **ev.metrics} for name, ev in result.evals.items()},
+        "sources": per_source_metrics(predictions),
         "notes": data.notes,
     }
     (run_dir / METRICS_FILE).write_text(
@@ -158,13 +162,28 @@ def split_scores(predictions: pd.DataFrame) -> dict[str, tuple[np.ndarray, np.nd
     }
 
 
+def per_source_metrics(predictions: pd.DataFrame) -> dict[str, dict[str, dict]]:
+    """数据来自多个文件夹的集合，按文件夹分别计算指标：{split: {文件夹: 指标}}。"""
+    if predictions.empty or SOURCE_COLUMN not in predictions:
+        return {}
+    result = {}
+    for split, part in predictions.groupby(SPLIT_COLUMN, sort=False):
+        if part[SOURCE_COLUMN].nunique() > 1:
+            result[split] = {
+                str(source): binary_metrics(rows[TRUE_COLUMN].to_numpy(), rows[PROB_COLUMN].to_numpy())
+                for source, rows in part.groupby(SOURCE_COLUMN, sort=False)
+            }
+    return result
+
+
 def per_point_accuracy(predictions: pd.DataFrame) -> pd.DataFrame:
-    """按 (split, scene, point) 统计样本数和准确率，准确率低的在前，用于找出容易判错的点位。"""
+    """按 (split, source, scene, point) 统计样本数和准确率，准确率低的在前，用于找出容易判错的点位。"""
     if predictions.empty or not {SCENE_COLUMN, POINT_COLUMN} <= set(predictions.columns):
         return pd.DataFrame()
     df = predictions.assign(correct=predictions[PRED_COLUMN] == predictions[TRUE_COLUMN])
+    keys = [SPLIT_COLUMN] + ([SOURCE_COLUMN] if SOURCE_COLUMN in df else []) + [SCENE_COLUMN, POINT_COLUMN, TRUE_COLUMN]
     table = (
-        df.groupby([SPLIT_COLUMN, SCENE_COLUMN, POINT_COLUMN, TRUE_COLUMN], sort=False)
+        df.groupby(keys, sort=False)
         .agg(samples=("correct", "size"), accuracy=("correct", "mean"), mean_prob=(PROB_COLUMN, "mean"))
         .reset_index()
     )

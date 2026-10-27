@@ -185,6 +185,34 @@ def test_save_and_load_run(dataset: Path, tmp_path: Path):
     assert points["accuracy"].is_monotonic_increasing
 
 
+def test_run_with_validation_folders(tmp_path: Path):
+    main = make_dataset(tmp_path / "train.csv", n_inside=8, n_outside=8, rows_per_point=15, seed=1)
+    merged = tmp_path / "merged"
+    for i, name in enumerate(["1024采集", "1025采集"]):
+        (merged / name).mkdir(parents=True)
+        make_dataset(merged / name / "_dataset.csv", n_inside=3, n_outside=3, rows_per_point=15, seed=i + 2)
+    cfg = config(main, tmp_path, epochs=3)
+    cfg.data.val_datasets = [str(merged)]  # 上级文件夹
+    data = prepare_data(cfg.data, cfg.train.seed)
+    result = fit(cfg, data)
+    run_dir = new_run_dir(cfg)
+    save_run(run_dir, cfg, data, result, figures=False)
+
+    run = load_run(run_dir)
+    assert run.config.data.val_datasets == [str(merged / n / "_dataset.csv") for n in ("1024采集", "1025采集")]
+    sources = run.metrics["sources"]
+    assert list(sources) == ["val"] and set(sources["val"]) == {"1024采集", "1025采集"}
+    assert sum(m["n"] for m in sources["val"].values()) == run.metrics["splits"]["val"]["n"] == 180
+    points = per_point_accuracy(run.predictions)
+    assert set(points[points["split"] == "val"]["source"]) == {"1024采集", "1025采集"}
+    assert set(run.predictions["source"]) == {"train", "1024采集", "1025采集"}
+
+    # 旧版本保存的 predictions.csv 没有 source 列，也能读取和统计
+    old = run.predictions.drop(columns="source")
+    old.to_csv(run_dir / "predictions.csv", index=False, encoding="utf-8-sig")
+    assert "source" not in per_point_accuracy(load_run(run_dir).predictions)
+
+
 def test_predictor_marks_missing_rows_when_trained_with_drop(dataset: Path, tmp_path: Path):
     cfg = config(dataset, tmp_path, epochs=2)
     data = prepare_data(cfg.data, cfg.train.seed)
@@ -214,6 +242,13 @@ def test_config_round_trip_and_validation(tmp_path: Path):
     bad.data.val_ratio, bad.data.test_ratio = 0.6, 0.5
     with pytest.raises(ValueError, match="之和"):
         bad.validate()
+    bad.data.val_datasets = ["D:/data/merged/1024采集"]  # 有独立验证集时验证集比例不生效
+    bad.validate()
+
+    # 旧版配置只有一个独立测试集 test_dataset
+    legacy = ExperimentConfig.from_dict({"data": {"test_dataset": "D:/b.csv"}})
+    assert legacy.data.test_datasets == ["D:/b.csv"] and legacy.data.val_datasets == []
+    assert ExperimentConfig.from_dict({"data": {"test_dataset": ""}}).data.test_datasets == []
 
 
 def test_cli(dataset: Path, tmp_path: Path, capsys):
@@ -231,6 +266,17 @@ def test_cli(dataset: Path, tmp_path: Path, capsys):
     saved.save(tmp_path / "c.json")
     assert cli_main(["--config", str(tmp_path / "c.json"), "--epochs", "1", "--name", "again"]) == 0
     assert any(p.name.endswith("_again") for p in out.iterdir())
+
+    # 多个独立验证集
+    for name in ("d1", "d2"):
+        (tmp_path / name).mkdir()
+        make_dataset(tmp_path / name / "_dataset.csv", n_inside=3, n_outside=3, rows_per_point=10, seed=len(name))
+    val_out = tmp_path / "val_runs"
+    assert cli_main(["--dataset", str(dataset), "--epochs", "1", "--output-dir", str(val_out),
+                     "--val-dataset", str(tmp_path / "d1"), "--val-dataset", str(tmp_path / "d2")]) == 0
+    (run_dir,) = val_out.iterdir()
+    assert len(load_run(run_dir).config.data.val_datasets) == 2
+    assert "  d1" in capsys.readouterr().out  # 按文件夹分别列出指标
 
     assert cli_main(["--dataset", str(dataset), "--list-features"]) == 0
     assert "rssi_FL" in capsys.readouterr().out

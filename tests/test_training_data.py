@@ -94,9 +94,64 @@ def test_missing_values(tmp_path: Path):
 def test_independent_test_dataset(tmp_path: Path):
     main = make_dataset(tmp_path / "a.csv", n_inside=6, n_outside=6, rows_per_point=10, seed=1)
     other = make_dataset(tmp_path / "b.csv", n_inside=3, n_outside=3, rows_per_point=10, seed=2)
-    data = prepare_data(DataConfig(dataset=str(main), test_dataset=str(other), val_ratio=0.3, test_ratio=0.5), seed=0)
-    assert len(data.test) == 60
-    assert len(data.train) + len(data.val) == 120
+    cfg = DataConfig(dataset=str(main), test_datasets=[str(other)], val_ratio=0.3, test_ratio=0.5)
+    data = prepare_data(cfg, seed=0)
+    assert len(data.test) == 60 and set(data.test.meta["source"]) == {"b"}
+    assert len(data.train) + len(data.val) == 120 and set(data.train.meta["source"]) == {"a"}
+
+
+def day(root: Path, name: str, seed: int, points: int = 3) -> Path:
+    folder = root / name
+    folder.mkdir(parents=True)
+    make_dataset(folder / "_dataset.csv", n_inside=points, n_outside=points, rows_per_point=10, seed=seed)
+    return folder
+
+
+def test_independent_validation_folders(tmp_path: Path):
+    main = day(tmp_path / "train", "1023采集", seed=1, points=6) / "_dataset.csv"
+    val = [day(tmp_path / "merged", "1024采集", seed=2), day(tmp_path / "merged", "1025采集", seed=3)]
+    test = day(tmp_path / "other", "1026采集", seed=4)
+    cfg = DataConfig(dataset=str(main), val_datasets=[str(v) for v in val], test_datasets=[str(test)])
+    notes = []
+    data = prepare_data(cfg, seed=0, log=notes.append)
+    assert len(data.train) == 120  # 验证集、测试集都是独立数据，训练数据全部用于训练
+    assert len(data.val) == 120 and len(data.test) == 60
+    assert data.val.meta["source"].value_counts().to_dict() == {"1024采集": 60, "1025采集": 60}
+    assert set(data.train.meta["source"]) == {"1023采集"}
+    assert data.val_files == [str(v / "_dataset.csv") for v in val]
+    assert data.test_files == [str(test / "_dataset.csv")]
+    assert any("独立数据" in n for n in notes) and any(n.strip().startswith("1025采集：") for n in notes)
+    # 各集合使用训练集的标准化参数
+    assert not np.allclose(data.val.x.mean(axis=0), 0, atol=1e-3)
+
+
+def test_parent_folder_expands_to_subfolders(tmp_path: Path):
+    main = day(tmp_path, "train", seed=1, points=6) / "_dataset.csv"
+    merged = tmp_path / "merged"
+    for i, name in enumerate(["day10", "day2", "day1"]):
+        day(merged, name, seed=i + 2)
+    (merged / "notes").mkdir()  # 没有 _dataset.csv 的子文件夹被跳过
+    cfg = DataConfig(dataset=str(main), val_datasets=[str(merged), str(merged / "day2")])
+    data = prepare_data(cfg, seed=0)
+    assert [Path(f).parent.name for f in data.val_files] == ["day1", "day2", "day10"]  # 自然排序、去重
+    assert len(data.val) == 180
+
+
+def test_independent_dataset_errors(tmp_path: Path):
+    main_dir = day(tmp_path, "train", seed=1)
+    main = main_dir / "_dataset.csv"
+    other = day(tmp_path, "other", seed=2)
+    (tmp_path / "empty").mkdir()
+    cases = [
+        ({"val_datasets": [str(tmp_path / "empty")]}, "都没有 _dataset.csv"),
+        ({"val_datasets": [str(tmp_path / "missing")]}, "找不到"),
+        ({"val_datasets": [str(main_dir)]}, "包含训练用的数据集"),
+        ({"test_datasets": [str(main)]}, "包含训练用的数据集"),
+        ({"val_datasets": [str(other)], "test_datasets": [str(other / "_dataset.csv")]}, "同时出现"),
+    ]
+    for kwargs, message in cases:
+        with pytest.raises(ValueError, match=message):
+            prepare_data(DataConfig(dataset=str(main), **kwargs), seed=0)
 
 
 def test_selected_features_and_errors(dataset: Path, tmp_path: Path):

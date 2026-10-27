@@ -106,6 +106,7 @@ python -m pytest
 pip install -r requirements.txt
 python train.py                                # 图形界面
 python train.py --config configs/mlp.json      # 命令行训练（参数见 python train.py --help）
+python train.py --config configs/mlp.json --val-dataset D:/data/merged/1024采集 --val-dataset D:/data/merged/1025采集
 ```
 
 只用 CPU 训练时，可以先装 CPU 版 PyTorch，下载量小很多：
@@ -117,7 +118,14 @@ python train.py --config configs/mlp.json      # 命令行训练（参数见 pyt
 
 - **候选特征**：能解析为数值的列，排除 `ts`、`ts_*`、`errcode_*`、`scene`、`point`、`label`。
   默认勾选所有非常数的列；界面中可按列名筛选（如输入 `rssi` 后点“全选”），列表里显示每列的缺失比例。
-- **独立测试集**（可选）：例如用另一天采集的总表做测试集，评估跨天的泛化能力；指定后上面的数据只划分训练集和验证集。
+- **独立验证集 / 独立测试集**（可选，各自可以有多个文件夹）：例如用其他几天采集的数据做验证集、测试集，
+  评估跨天的泛化能力。每个文件夹里有一个 `_dataset.csv`（即数据集构建工具的导出文件夹，如 `merged/1024采集/`）。
+  - 点“添加文件夹…”，或从资源管理器把一个或多个文件夹拖进列表。
+    选择上级文件夹（如 `merged/`）会添加其中所有含 `_dataset.csv` 的子文件夹，训练数据所在的文件夹会自动跳过。
+  - 多个文件夹的数据合在一起作为验证集（或测试集），用于选最佳 epoch、提前停止、比较参数组合；
+    评估结果中还会按文件夹分别列出指标，看出每次采集的表现。
+  - 指定后，对应的“验证集比例” / “测试集比例”不生效，训练数据不再划出这部分。
+  - 同一份数据不能既用于训练又用于验证 / 测试，也不能同时出现在验证集和测试集中，否则开始训练时会报错。
 
 ### 模型与损失
 
@@ -146,7 +154,8 @@ python train.py --config configs/mlp.json      # 命令行训练（参数见 pyt
 | 标准化 | `data.standardize`：按训练集均值、标准差做 z-score | — | 开 |
 | 划分方式 | `data.split`：`point` 按点位整组 / `row` 按行随机 | `--split` | point |
 | 验证集 / 测试集比例 | `data.val_ratio` / `data.test_ratio` | `--val-ratio` / `--test-ratio` | 0.2 / 0.1 |
-| 独立测试集 | `data.test_dataset` | `--test-dataset` | 无 |
+| 独立验证集 | `data.val_datasets`（文件夹列表） | `--val-dataset 文件夹`（可重复） | 无 |
+| 独立测试集 | `data.test_datasets`（文件夹列表） | `--test-dataset 文件夹`（可重复） | 无 |
 | 随机种子 | `train.seed`（数据划分和模型初始化） | `--seed` | 42 |
 | 设备 | `train.device`：`auto` / `cpu` / `cuda` | `--device` | auto |
 
@@ -161,8 +170,9 @@ python train.py --config configs/mlp.json      # 命令行训练（参数见 pyt
 - **损失曲线**：总损失、交叉熵、L2 正则项三张图，训练集与验证集对比，竖线标出最佳 epoch。
   鼠标移到图上显示该 epoch 的数值；工具栏可缩放、平移、保存图片。
 - **评价指标**：验证集的准确率、精确率、召回率、F1、AUC 随 epoch 的变化。
-- **评估结果**：最佳模型在训练 / 验证 / 测试集上的指标表，验证集和测试集的混淆矩阵、ROC 曲线，
-  以及**各点位的准确率**（从低到高，准确率低于 80% 标黄），方便找出容易判错的位置。
+- **评估结果**：最佳模型在训练 / 验证 / 测试集上的指标表（独立验证集 / 测试集有多个文件夹时，逐个文件夹列出），
+  验证集和测试集的混淆矩阵、ROC 曲线，以及**各点位的准确率**（含来源文件夹，从低到高，准确率低于 80% 标黄），
+  方便找出容易判错的位置。
 - **训练记录**：每个 epoch 的全部数值，最佳 epoch 一行高亮。
 - **打开训练结果…**：重新查看以前某次训练的曲线和评估结果，并把它的配置载入左侧，方便对比、微调后再训练。
 
@@ -214,10 +224,10 @@ python train.py --config configs/mlp.json --workers 8 \
 
 | 文件 | 内容 |
 | --- | --- |
-| `config.json` | 本次完整配置（`features` 为实际使用的特征），`python train.py --config` 可直接复现 |
+| `config.json` | 本次完整配置（`features` 为实际使用的特征，独立验证集 / 测试集为实际使用的文件），`python train.py --config` 可直接复现 |
 | `history.csv` | 每个 epoch 的损失与验证集指标 |
-| `metrics.json` | 最佳模型在各数据集上的指标、混淆矩阵 `[[TN, FP], [FN, TP]]`，以及数据划分说明 |
-| `predictions.csv` | 每个样本的 `split, ts, scene, point, label, prob`（车内概率）`, pred` |
+| `metrics.json` | 最佳模型在各数据集上的指标、混淆矩阵 `[[TN, FP], [FN, TP]]`、按文件夹的指标（`sources`），以及数据划分说明 |
+| `predictions.csv` | 每个样本的 `split, source`（来自哪个文件夹）`, ts, scene, point, label, prob`（车内概率）`, pred` |
 | `model.pt` | 模型参数 + 特征列表 + 缺失值填充值 + 标准化参数 |
 | `loss.png` / `metrics.png` / `evaluation.png` | 图表 |
 

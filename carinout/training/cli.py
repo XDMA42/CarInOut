@@ -29,7 +29,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--config", help="训练配置 JSON（可在界面中“保存配置”得到）")
     p.add_argument("--dataset", help="数据集构建工具导出的 _dataset.csv")
-    p.add_argument("--test-dataset", help="可选：独立测试集")
+    p.add_argument(
+        "--val-dataset",
+        action="append",
+        metavar="文件夹",
+        help="独立验证集，可重复：含 _dataset.csv 的文件夹、其上级文件夹（取各子文件夹）或 csv 文件",
+    )
+    p.add_argument("--test-dataset", action="append", metavar="文件夹", help="独立测试集，可重复，格式同 --val-dataset")
     p.add_argument("--features", help="输入特征列，逗号分隔；不指定时使用全部非常数的数值列")
     p.add_argument("--list-features", action="store_true", help="列出数据集中可用的特征列后退出")
     p.add_argument("--model", help=f"模型：{models}")
@@ -68,7 +74,8 @@ def apply_args(cfg: ExperimentConfig, args: argparse.Namespace) -> ExperimentCon
     d, t = cfg.data, cfg.train
     simple = {
         "dataset": (d, "dataset"),
-        "test_dataset": (d, "test_dataset"),
+        "val_dataset": (d, "val_datasets"),
+        "test_dataset": (d, "test_datasets"),
         "missing": (d, "missing"),
         "split": (d, "split"),
         "val_ratio": (d, "val_ratio"),
@@ -130,7 +137,7 @@ def _list_features(cfg: ExperimentConfig) -> int:
 
 def _train(cfg: ExperimentConfig) -> int:
     from .data import prepare_data
-    from .runs import new_run_dir, save_run
+    from .runs import new_run_dir, per_source_metrics, predictions_frame, save_run
     from .trainer import fit
 
     data = prepare_data(cfg.data, cfg.train.seed, log=print)
@@ -154,10 +161,14 @@ def _train(cfg: ExperimentConfig) -> int:
     save_run(run_dir, cfg, data, result)
 
     print(f"\n最佳 epoch：{result.best_epoch}")
-    print(f"{'':<8}{'样本数':>8}{'交叉熵':>10}" + "".join(f"{name:>10}" for name in METRIC_NAMES.values()))
+    print(f"{'':<16}{'样本数':>8}{'交叉熵':>10}" + "".join(f"{name:>10}" for name in METRIC_NAMES.values()))
+    sources = per_source_metrics(predictions_frame(data, result))
     for name, ev in result.evals.items():
         values = "".join(f"{ev.metrics[k]:>10.4f}" for k in METRIC_NAMES)
-        print(f"{SPLIT_NAMES[name]:<8}{ev.metrics['n']:>8}{ev.loss:>10.4f}{values}")
+        print(f"{SPLIT_NAMES[name]:<16}{ev.metrics['n']:>8}{ev.loss:>10.4f}{values}")
+        for source, m in sources.get(name, {}).items():  # 来自多个文件夹时逐个列出
+            values = "".join(f"{_num(m[k]):>10}" for k in METRIC_NAMES)
+            print(f"  {source:<14}{m['n']:>8}{'':>10}{values}")
     print(f"\n训练结果已保存到 {run_dir}")
     return 0
 
@@ -222,3 +233,7 @@ def _ctrl_c_stops(action: str) -> Iterator[Callable[[], bool]]:
         yield lambda: stop
     finally:
         signal.signal(signal.SIGINT, previous)
+
+
+def _num(value) -> str:
+    return "—" if value is None or (isinstance(value, float) and math.isnan(value)) else f"{value:.4f}"

@@ -2,6 +2,9 @@
 
 总表格式（见 merger.build_dataset）：ts, <原列名>_<锚点名>..., scene, point, label。
 ts / ts_* / errcode_* 以及 scene、point、label 不作为特征；其余能解析为数值的列都是候选特征。
+
+验证集、测试集可以从训练数据中划分，也可以指定独立的数据（多个文件夹，每个文件夹一个 _dataset.csv），
+每行都记录来自哪个文件夹（source 列），便于分别统计各次采集的表现。
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 from ..merger import (
+    COMBINED_FILENAME,
     LABEL_INSIDE,
     LABEL_OUTSIDE,
     POINT_COLUMN,
@@ -22,6 +26,7 @@ from ..merger import (
     CsvReadError,
     read_csv_text,
 )
+from ..parser import natural_key
 from .config import MISSING_CONSTANT, MISSING_DROP, MISSING_MEAN, SPLIT_POINT, DataConfig
 
 NUM_CLASSES = 2
@@ -29,7 +34,8 @@ CLASS_NAMES = {LABEL_OUTSIDE: "车外", LABEL_INSIDE: "车内"}
 SPLITS = ("train", "val", "test")
 SPLIT_NAMES = {"train": "训练集", "val": "验证集", "test": "测试集"}
 
-META_COLUMNS = (TS_COLUMN, SCENE_COLUMN, POINT_COLUMN)  # 随预测结果一起保存，便于按点位分析
+SOURCE_COLUMN = "source"  # 数据来自哪个文件夹（_dataset.csv 所在文件夹名）
+META_COLUMNS = (SOURCE_COLUMN, TS_COLUMN, SCENE_COLUMN, POINT_COLUMN)  # 随预测结果一起保存，便于按点位分析
 EXCLUDED_PREFIXES = (f"{TS_COLUMN}_", "errcode_")
 
 
@@ -44,7 +50,7 @@ class FeatureInfo:
 class Split:
     x: np.ndarray  # (样本数, 特征数) float32，已填充缺失值并标准化
     y: np.ndarray  # (样本数,) int64
-    meta: pd.DataFrame  # ts / scene / point（存在时），与 x 逐行对应
+    meta: pd.DataFrame  # source / ts / scene / point（存在时），与 x 逐行对应
 
     def __len__(self) -> int:
         return len(self.y)
@@ -73,9 +79,42 @@ class PreparedData:
     fill_values: np.ndarray | None  # 每个特征的缺失填充值；missing == drop 时为 None
     scaler: Standardizer | None
     notes: list[str] = field(default_factory=list)  # 划分情况与提示，显示在日志中
+    val_files: list[str] = field(default_factory=list)  # 独立验证集的文件（已展开文件夹）
+    test_files: list[str] = field(default_factory=list)
 
     def split(self, name: str) -> Split:
         return getattr(self, name)
+
+
+def resolve_datasets(entries: list[str]) -> list[Path]:
+    """把独立验证集 / 测试集的各项展开为 csv 文件列表（去重）。
+
+    含 _dataset.csv 的文件夹 → 该文件；不含的文件夹 → 各子文件夹中的 _dataset.csv（如数据集构建工具的
+    merged 文件夹）；csv 文件 → 本身。
+    """
+    files: list[Path] = []
+    for entry in entries:
+        path = Path(entry)
+        if path.is_file():
+            found = [path]
+        elif (path / COMBINED_FILENAME).is_file():
+            found = [path / COMBINED_FILENAME]
+        elif path.is_dir():
+            subdirs = sorted((d for d in path.iterdir() if d.is_dir()), key=lambda d: natural_key(d.name))
+            found = [d / COMBINED_FILENAME for d in subdirs if (d / COMBINED_FILENAME).is_file()]
+            if not found:
+                raise ValueError(f"{path} 及其子文件夹中都没有 {COMBINED_FILENAME}")
+        else:
+            raise ValueError(f"找不到 {path}")
+        seen = {f.resolve() for f in files}
+        files.extend(f for f in found if f.resolve() not in seen)
+    return files
+
+
+def dataset_name(path: str | Path) -> str:
+    """数据的简称：_dataset.csv 取所在文件夹名（如 “1023采集”），其他 csv 取文件名。"""
+    path = Path(path)
+    return path.parent.name if path.name == COMBINED_FILENAME else path.stem
 
 
 def load_table(path: str | Path) -> pd.DataFrame:
@@ -175,29 +214,37 @@ def prepare_data(cfg: DataConfig, seed: int, log: Callable[[str], None] | None =
     if not cfg.dataset:
         raise ValueError("请先选择数据集文件（数据集构建工具导出的 _dataset.csv）")
     notes: list[str] = []
-    df = load_table(cfg.dataset)
+    main_path = Path(cfg.dataset)
+    extra = {"val": resolve_datasets(cfg.val_datasets), "test": resolve_datasets(cfg.test_datasets)}
+    _check_overlap(main_path, extra)
+    df = load_table(main_path)
     parse_labels(df, cfg.label_column)  # 先检查标签列，报错更直接
     infos = feature_candidates(df, cfg.label_column)
     features = list(cfg.features) or default_features(infos)
     if not features:
         raise ValueError("数据中没有可用的数值特征列")
-    _check_features(df, features, Path(cfg.dataset).name)
+    _check_features(df, features, dataset_name(main_path))
 
-    frame = _clean(df, features, cfg, notes, Path(cfg.dataset).name)
+    frame = _clean(df, features, cfg, notes, main_path)
     labels = frame["__label"].to_numpy(dtype=np.int64)
     use_groups = cfg.split == SPLIT_POINT
     if use_groups and not {SCENE_COLUMN, POINT_COLUMN} <= set(frame.columns):
         notes.append(f"数据中缺少 {SCENE_COLUMN} / {POINT_COLUMN} 列，改为按行随机划分")
         use_groups = False
     groups = (frame[SCENE_COLUMN] + "\x1f" + frame[POINT_COLUMN]).to_numpy() if use_groups else None
-    test_ratio = 0.0 if cfg.test_dataset else cfg.test_ratio
-    idx_train, idx_val, idx_test = split_indices(labels, groups, cfg.val_ratio, test_ratio, seed)
+    val_ratio = 0.0 if extra["val"] else cfg.val_ratio
+    test_ratio = 0.0 if extra["test"] else cfg.test_ratio
+    idx_train, idx_val, idx_test = split_indices(labels, groups, val_ratio, test_ratio, seed)
 
     frames = {"train": frame.iloc[idx_train], "val": frame.iloc[idx_val], "test": frame.iloc[idx_test]}
-    if cfg.test_dataset:
-        test_df = load_table(cfg.test_dataset)
-        _check_features(test_df, features, Path(cfg.test_dataset).name)
-        frames["test"] = _clean(test_df, features, cfg, notes, Path(cfg.test_dataset).name)
+    for name, files in extra.items():
+        if files:
+            parts = []
+            for path in files:
+                extra_df = load_table(path)
+                _check_features(extra_df, features, dataset_name(path))
+                parts.append(_clean(extra_df, features, cfg, notes, path))
+            frames[name] = pd.concat(parts, ignore_index=True)
 
     train_x = frames["train"][features].to_numpy(dtype=np.float64)
     if len(np.unique(frames["train"]["__label"])) < NUM_CLASSES:
@@ -220,10 +267,25 @@ def prepare_data(cfg: DataConfig, seed: int, log: Callable[[str], None] | None =
         labels = part["__label"].to_numpy(dtype=np.int64, copy=True)  # torch 需要可写数组
         splits[name] = Split(x.astype(np.float32), labels, meta)
 
-    notes.extend(_describe_splits(splits, groups is not None))
+    notes.extend(_describe_splits(splits, groups is not None, {k for k, files in extra.items() if files}))
     for note in notes:
         log(note)
-    return PreparedData(features, splits["train"], splits["val"], splits["test"], fill_values, scaler, notes)
+    return PreparedData(
+        features, splits["train"], splits["val"], splits["test"], fill_values, scaler, notes,
+        val_files=[str(p) for p in extra["val"]], test_files=[str(p) for p in extra["test"]],
+    )
+
+
+def _check_overlap(main_path: Path, extra: dict[str, list[Path]]) -> None:
+    """同一份数据不能既用于训练又用于评估，也不能同时出现在验证集和测试集中。"""
+    main = main_path.resolve()
+    for name, files in extra.items():
+        if main in {f.resolve() for f in files}:
+            raise ValueError(f"{SPLIT_NAMES[name]}中包含训练用的数据集 {dataset_name(main_path)}，评估结果会偏乐观")
+    both = {f.resolve() for f in extra["val"]} & {f.resolve() for f in extra["test"]}
+    if both:
+        names = "、".join(sorted(dataset_name(p) for p in both))
+        raise ValueError(f"{names} 同时出现在验证集和测试集中")
 
 
 def _check_features(df: pd.DataFrame, features: list[str], source: str) -> None:
@@ -236,14 +298,16 @@ def _check_features(df: pd.DataFrame, features: list[str], source: str) -> None:
         raise ValueError(f"{source} 中以下列不是数值，不能作为特征：{'、'.join(bad)}")
 
 
-def _clean(df: pd.DataFrame, features: list[str], cfg: DataConfig, notes: list[str], source: str) -> pd.DataFrame:
+def _clean(df: pd.DataFrame, features: list[str], cfg: DataConfig, notes: list[str], path: Path) -> pd.DataFrame:
     """取出特征（float）、标签与元信息列，丢弃无标签的行；missing == drop 时丢弃含缺失值的行。"""
+    source = dataset_name(path)
     labels = parse_labels(df, cfg.label_column)
     out = pd.DataFrame({f: to_numeric(df[f]) for f in features})
     out["__label"] = labels
     for col in META_COLUMNS:
         if col in df.columns and col not in out.columns:
             out[col] = df[col].astype(str)
+    out[SOURCE_COLUMN] = source
     unlabeled = int(labels.isna().sum())
     if unlabeled:
         notes.append(f"{source}：{unlabeled} 行没有标签，已忽略")
@@ -265,15 +329,23 @@ def _fill(x: np.ndarray, fill_values: np.ndarray | None) -> np.ndarray:
     return np.where(np.isnan(x), fill_values, x)
 
 
-def _describe_splits(splits: dict[str, Split], by_group: bool) -> list[str]:
+def _describe_splits(splits: dict[str, Split], by_group: bool, independent: set[str]) -> list[str]:
     total = sum(len(s) for s in splits.values()) or 1
     lines = ["数据划分：" + ("按点位整组划分" if by_group else "按行随机划分")]
     for name, s in splits.items():
-        counts = "，".join(f"{CLASS_NAMES[c]} {int((s.y == c).sum())}" for c in CLASS_NAMES)
-        text = f"  {SPLIT_NAMES[name]}：{len(s)} 行（{len(s) / total:.0%}；{counts}）"
-        if {SCENE_COLUMN, POINT_COLUMN} <= set(s.meta.columns) and len(s):
-            text += f"，{len(s.meta.groupby([SCENE_COLUMN, POINT_COLUMN]))} 个点位"
-        lines.append(text)
+        origin = "，独立数据" if name in independent else ""
+        lines.append(f"  {SPLIT_NAMES[name]}：{_counts(s.meta, s.y)}（占 {len(s) / total:.0%}{origin}）")
+        if SOURCE_COLUMN in s.meta and s.meta[SOURCE_COLUMN].nunique() > 1:
+            for source, rows in s.meta.groupby(SOURCE_COLUMN, sort=False).indices.items():
+                lines.append(f"    {source}：{_counts(s.meta.iloc[rows], s.y[rows])}")
         if name != "train" and len(s) and len(np.unique(s.y)) < NUM_CLASSES:
             lines.append(f"  注意：{SPLIT_NAMES[name]}只有一个类别，AUC 等指标无法计算（点位太少时可改为按行划分）")
     return lines
+
+
+def _counts(meta: pd.DataFrame, y: np.ndarray) -> str:
+    text = f"{len(y)} 行，" + "，".join(f"{CLASS_NAMES[c]} {int((y == c).sum())}" for c in CLASS_NAMES)
+    keys = [c for c in (SOURCE_COLUMN, SCENE_COLUMN, POINT_COLUMN) if c in meta.columns]
+    if {SCENE_COLUMN, POINT_COLUMN} <= set(keys) and len(y):
+        text += f"，{meta.groupby(keys).ngroups} 个点位"
+    return text

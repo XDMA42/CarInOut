@@ -78,6 +78,7 @@ from ..training.runs import (
 )
 from ..training.sweep import is_sweep_dir, load_sweep
 from ..training.trainer import HISTORY_COLUMNS, fit
+from .dataset_list import DatasetList
 from .sweep_panel import SweepPanel
 from .train_charts import EpochChart, EvaluationChart
 
@@ -246,25 +247,32 @@ class TrainWindow(QMainWindow):
         self.dataset_info = QLabel("尚未加载数据集")
         self.dataset_info.setWordWrap(True)
         self.dataset_info.setStyleSheet("color: gray")
+        # 滚动区域中自动换行的标签可能被压成一行，预留两行高度
+        self.dataset_info.setMinimumHeight(self.dataset_info.fontMetrics().lineSpacing() * 2 + 2)
 
-        self.test_edit = QLineEdit()
-        self.test_edit.setPlaceholderText("可选：独立测试集，如另一天采集的总表")
-        self.test_edit.setToolTip("指定后用该文件全部数据做测试集，上面的数据集只划分训练集和验证集")
-        self.test_edit.textChanged.connect(self._update_ratio_state)
-        tbrowse = QPushButton("浏览…")
-        tbrowse.clicked.connect(self._choose_test_dataset)
-        tclear = QPushButton("清除")
-        tclear.clicked.connect(self.test_edit.clear)
-        trow = QHBoxLayout()
-        trow.addWidget(self.test_edit, 1)
-        trow.addWidget(tbrowse)
-        trow.addWidget(tclear)
+        # 独立验证集 / 测试集：如其他几天采集的数据，可以有多个文件夹
+        self.val_list = DatasetList(
+            "未指定时按“验证集比例”从上面的数据集中划分",
+            "共 {n} 个文件夹，“验证集比例”不生效",
+            self._dataset_browse_dir,
+            lambda: self._excluded_datasets(self.test_list, "已在测试集中"),
+        )
+        self.test_list = DatasetList(
+            "未指定时按“测试集比例”从上面的数据集中划分",
+            "共 {n} 个文件夹，“测试集比例”不生效",
+            self._dataset_browse_dir,
+            lambda: self._excluded_datasets(self.val_list, "已在验证集中"),
+        )
+        for widget in (self.val_list, self.test_list):
+            widget.changed.connect(self._update_ratio_state)
 
         lay = QVBoxLayout(box)
         lay.addLayout(row)
         lay.addWidget(self.dataset_info)
-        lay.addWidget(QLabel("独立测试集"))
-        lay.addLayout(trow)
+        lay.addWidget(QLabel("独立验证集（可选，可多个文件夹）"))
+        lay.addWidget(self.val_list)
+        lay.addWidget(QLabel("独立测试集（可选，可多个文件夹）"))
+        lay.addWidget(self.test_list)
         return box
 
     def _build_feature_group(self) -> QWidget:
@@ -448,11 +456,11 @@ class TrainWindow(QMainWindow):
         head.addWidget(self.open_run_btn)
 
         self.summary_table = self._table(["数据集", "样本数", "交叉熵", *METRIC_NAMES.values()])
-        self.summary_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        rows = self.summary_table.verticalHeader().defaultSectionSize() * 3  # 训练 / 验证 / 测试
-        self.summary_table.setFixedHeight(self.summary_table.horizontalHeader().sizeHint().height() + rows + 4)
+        self._fit_summary_height(3)
         self.eval_chart = EvaluationChart()
-        self.point_table = self._table(["数据集", "场景", "点位", "真实类别", "样本数", "准确率", "平均车内概率"])
+        self.point_table = self._table(
+            ["数据集", "来源", "场景", "点位", "真实类别", "样本数", "准确率", "平均车内概率"]
+        )
         point_box = QWidget()
         play = QVBoxLayout(point_box)
         play.setContentsMargins(0, 0, 0, 0)
@@ -509,11 +517,17 @@ class TrainWindow(QMainWindow):
             self.dataset_edit.setText(path)
             self._load_dataset(path)
 
-    def _choose_test_dataset(self) -> None:
-        start = self.test_edit.text() or self.dataset_edit.text() or str(PROJECT_ROOT)
-        path, _ = QFileDialog.getOpenFileName(self, "选择独立测试集", start, "CSV 文件 (*.csv);;所有文件 (*)")
-        if path:
-            self.test_edit.setText(path)
+    def _excluded_datasets(self, other: DatasetList, reason: str) -> dict[str, str]:
+        """不能加入独立验证集 / 测试集的数据：训练数据本身，以及已在另一个列表中的文件夹。"""
+        excluded = {path: reason for path in other.paths()}
+        if self.dataset_edit.text().strip():
+            excluded[self.dataset_edit.text().strip()] = "训练数据"
+        return excluded
+
+    def _dataset_browse_dir(self) -> str:
+        """选择独立验证集 / 测试集时的起始位置：训练数据所在文件夹的上一级（通常是 merged）。"""
+        dataset = self.dataset_edit.text().strip()
+        return str(Path(dataset).parent.parent) if dataset else str(PROJECT_ROOT)
 
     def _load_dataset(self, path: str, keep: list[str] | None = None) -> None:
         """读取数据集并列出候选特征。keep 为要勾选的特征（来自配置），为 None 时沿用当前勾选或使用默认。"""
@@ -692,7 +706,8 @@ class TrainWindow(QMainWindow):
         cfg = ExperimentConfig(
             data=DataConfig(
                 dataset=self.dataset_edit.text().strip(),
-                test_dataset=self.test_edit.text().strip(),
+                val_datasets=self.val_list.paths(),
+                test_datasets=self.test_list.paths(),
                 features=self._checked_features(),
                 label_column=self._label_column,
                 missing=self.missing_combo.currentData(),
@@ -723,7 +738,8 @@ class TrainWindow(QMainWindow):
     def _apply_config(self, cfg: ExperimentConfig) -> None:
         d, t = cfg.data, cfg.train
         self._label_column = d.label_column
-        self.test_edit.setText(d.test_dataset)
+        self.val_list.set_paths(d.val_datasets)
+        self.test_list.set_paths(d.test_datasets)
         self._set_combo(self.missing_combo, d.missing)
         self.fill_spin.setValue(d.fill_value)
         self.standardize_check.setChecked(d.standardize)
@@ -767,9 +783,11 @@ class TrainWindow(QMainWindow):
         self.fill_spin.setEnabled(self.missing_combo.currentData() == MISSING_CONSTANT)
 
     def _update_ratio_state(self) -> None:
-        has_test = bool(self.test_edit.text().strip())
-        self.test_spin.setEnabled(not has_test)
-        self.test_spin.setToolTip("已指定独立测试集，此项不生效" if has_test else "从数据集中划出的测试集比例")
+        pairs = ((self.val_spin, self.val_list, "验证集"), (self.test_spin, self.test_list, "测试集"))
+        for spin, widget, name in pairs:
+            independent = bool(widget.paths())
+            spin.setEnabled(not independent)
+            spin.setToolTip(f"已指定独立{name}，此项不生效" if independent else f"从数据集中划出的{name}比例")
 
     def _load_state(self) -> tuple[ExperimentConfig, dict]:
         """返回 (训练配置, 参数遍历页的设置)。"""
@@ -1037,13 +1055,12 @@ class TrainWindow(QMainWindow):
             f"{run.path}\n共训练 {m.get('epochs_run', len(run.history))} 个 epoch{state}，{used}，"
             f"{m.get('num_parameters', 0):,} 个参数，{len(m.get('features', []))} 个输入特征"
         )
+        sources = m.get("sources", {})
         for name, values in m.get("splits", {}).items():
-            row = self.summary_table.rowCount()
-            self.summary_table.insertRow(row)
-            cells = [SPLIT_NAMES.get(name, name), f"{values.get('n', 0):,}", _fmt(values.get("loss"), "{:.4f}")]
-            cells += [_fmt(values.get(k), "{:.4f}" if k == "auc" else "{:.2%}") for k in METRIC_NAMES]
-            for col, text in enumerate(cells):
-                self.summary_table.setItem(row, col, QTableWidgetItem(text))
+            self._add_summary_row(SPLIT_NAMES.get(name, name), values)
+            for source, source_values in sources.get(name, {}).items():  # 来自多个文件夹时逐个列出
+                self._add_summary_row(f"    └ {source}", source_values)
+        self._fit_summary_height(self.summary_table.rowCount())
         self.eval_chart.update_scores(split_scores(run.predictions))
 
         table = per_point_accuracy(run.predictions)
@@ -1054,6 +1071,7 @@ class TrainWindow(QMainWindow):
                 self.point_table.insertRow(row)
                 cells = [
                     SPLIT_NAMES.get(rec.split, rec.split),
+                    getattr(rec, "source", ""),
                     rec.scene,
                     rec.point,
                     CLASS_NAMES.get(rec.label, rec.label),
@@ -1067,6 +1085,22 @@ class TrainWindow(QMainWindow):
                         item.setBackground(WARN_BG)
                     self.point_table.setItem(row, col, item)
         self.statusBar().showMessage(f"训练结果：{run.path}")
+
+    def _add_summary_row(self, label: str, values: dict) -> None:
+        row = self.summary_table.rowCount()
+        self.summary_table.insertRow(row)
+        cells = [label, f"{values.get('n', 0):,}", _fmt(values.get("loss"), "{:.4f}")]
+        cells += [_fmt(values.get(k), "{:.4f}" if k == "auc" else "{:.2%}") for k in METRIC_NAMES]
+        for col, text in enumerate(cells):
+            self.summary_table.setItem(row, col, QTableWidgetItem(text))
+
+    def _fit_summary_height(self, rows: int) -> None:
+        """指标表按行数调整高度，最多显示 8 行，再多时滚动。"""
+        visible = min(max(rows, 3), 8)
+        height = self.summary_table.verticalHeader().defaultSectionSize() * visible
+        self.summary_table.setFixedHeight(self.summary_table.horizontalHeader().sizeHint().height() + height + 4)
+        policy = Qt.ScrollBarPolicy.ScrollBarAsNeeded if rows > 8 else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        self.summary_table.setVerticalScrollBarPolicy(policy)
 
     def _open_run_folder(self) -> None:
         if self._run is not None:
