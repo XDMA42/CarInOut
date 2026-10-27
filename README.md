@@ -58,3 +58,11 @@ python main.py
 ```bash
 python -m pytest
 ```
+
+### 常见问题
+
+- **启动时报 `OpenBLAS error: Memory allocation still failed after 10 retries`**：
+  numpy 自带的 OpenBLAS 会按 CPU 核数为每个线程预留内存，核数多或内存紧张时分配失败。
+  `main.py` 已在导入 numpy/pandas 前把 `OPENBLAS_NUM_THREADS` 等设为 1（本工具不做矩阵运算，不影响速度）。
+  如果在其他脚本里直接 `import carinout`，请在导入 pandas 之前先设置这个环境变量。
+  如果仍然报错，请检查是否为 32 位 Python：`python -c "import struct; print(struct.calcsize('P') * 8)"`，应输出 64。
