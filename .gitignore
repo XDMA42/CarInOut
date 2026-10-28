@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+config.json
+train_gui.json
+runs/
