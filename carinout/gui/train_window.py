@@ -7,8 +7,8 @@ import math
 from pathlib import Path
 
 import pandas as pd
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QDoubleValidator
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QColor, QDoubleValidator
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -55,10 +55,9 @@ from ..training.config import (
 from ..training.data import (
     CLASS_NAMES,
     NUM_CLASSES,
-    SPLIT_NAMES,
     FeatureInfo,
-    default_features,
     dataset_name,
+    default_features,
     feature_candidates,
     load_table,
     parse_labels,
@@ -66,7 +65,7 @@ from ..training.data import (
     prepare_data,
     resolve_datasets,
 )
-from ..training.metrics import METRIC_NAMES
+from ..training.evaluate import is_evaluation_dir, load_evaluation
 from ..training.models import available_models, get_spec
 from ..training.models.base import KIND_BOOL, KIND_CHOICE, KIND_FLOAT, KIND_INT, ModelSpec, ParamSpec
 from ..training.plots import draw_losses, draw_metrics
@@ -74,21 +73,20 @@ from ..training.runs import (
     RunRecord,
     load_run,
     new_run_dir,
-    per_point_accuracy,
     save_run,
     save_run_figures,
-    split_scores,
 )
 from ..training.sweep import is_sweep_dir, load_sweep
 from ..training.trainer import HISTORY_COLUMNS, fit
 from .dataset_list import DatasetList
+from .evaluate_panel import EvaluatePanel
+from .evaluation_view import EvaluationView
 from .sweep_panel import SweepPanel
-from .train_charts import EpochChart, EvaluationChart
+from .train_charts import EpochChart
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 STATE_PATH = PROJECT_ROOT / "train_gui.json"  # 上次使用的训练配置，下次启动自动恢复
 ROLE_NAME = Qt.ItemDataRole.UserRole
-WARN_BG = QColor(245, 158, 11, 60)
 BEST_BG = QColor(42, 120, 214, 40)
 
 # 训练记录表格的列，顺序同 trainer.HISTORY_COLUMNS
@@ -188,9 +186,10 @@ class TrainWindow(QMainWindow):
         self.statusBar()
 
         self._ready = True
-        cfg, sweep_state = self._load_state()
+        cfg, state = self._load_state()
         self._apply_config(cfg)
-        self.sweep_panel.restore(sweep_state)
+        self.sweep_panel.restore(state.get("sweep") or {})
+        self.evaluate_panel.restore(state.get("evaluate") or {})
 
     # ------------------------------------------------------------------ 界面搭建
     def _build_config_panel(self) -> QWidget:
@@ -435,7 +434,8 @@ class TrainWindow(QMainWindow):
         self.metric_chart = EpochChart(draw_metrics, 10, 4)
         self.tabs.addTab(self.loss_chart, "损失曲线")
         self.tabs.addTab(self.metric_chart, "评价指标")
-        self.tabs.addTab(self._build_eval_tab(), "评估结果")
+        self.eval_page = EvaluationView("训练完成后在这里显示最佳模型在各数据集上的表现")
+        self.tabs.addTab(self.eval_page, "评估结果")
 
         self.history_table = self._table([HISTORY_HEADERS[c] for c in HISTORY_COLUMNS])
         self.tabs.addTab(self.history_table, "训练记录")
@@ -446,44 +446,11 @@ class TrainWindow(QMainWindow):
         self.sweep_panel.applyConfigRequested.connect(self._apply_sweep_config)
         self.sweep_panel.message.connect(self._log)
         self.tabs.addTab(self.sweep_panel, "参数遍历")
+
+        self.evaluate_panel = EvaluatePanel(lambda: self._run.path if self._run else None, self._dataset_browse_dir)
+        self.evaluate_panel.message.connect(self._log)
+        self.tabs.addTab(self.evaluate_panel, "模型评估")
         return self.tabs
-
-    def _build_eval_tab(self) -> QWidget:
-        self.run_label = QLabel("训练完成后在这里显示最佳模型在各数据集上的表现")
-        self.run_label.setWordWrap(True)
-        self.run_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.open_run_btn = QPushButton("打开结果文件夹")
-        self.open_run_btn.setEnabled(False)
-        self.open_run_btn.clicked.connect(self._open_run_folder)
-        head = QHBoxLayout()
-        head.addWidget(self.run_label, 1)
-        head.addWidget(self.open_run_btn)
-
-        self.summary_table = self._table(["数据集", "样本数", "交叉熵", *METRIC_NAMES.values()])
-        self._fit_summary_height(3)
-        self.eval_chart = EvaluationChart()
-        self.point_table = self._table(
-            ["数据集", "来源", "场景", "点位", "真实类别", "样本数", "准确率", "平均车内概率"]
-        )
-        point_box = QWidget()
-        play = QVBoxLayout(point_box)
-        play.setContentsMargins(0, 0, 0, 0)
-        hint = QLabel("各点位准确率（验证集、测试集，从低到高）—— 找出容易判错的位置")
-        hint.setStyleSheet("color: gray")
-        play.addWidget(hint)
-        play.addWidget(self.point_table)
-
-        split = QSplitter(Qt.Orientation.Vertical)
-        split.addWidget(self.eval_chart)
-        split.addWidget(point_box)
-        split.setSizes([420, 200])
-
-        self.eval_page = QWidget()
-        lay = QVBoxLayout(self.eval_page)
-        lay.addLayout(head)
-        lay.addWidget(self.summary_table)
-        lay.addWidget(split, 1)
-        return self.eval_page
 
     @staticmethod
     def _table(headers: list[str]) -> QTableWidget:
@@ -804,13 +771,12 @@ class TrainWindow(QMainWindow):
             spin.setToolTip(f"已指定独立{name}，此项不生效" if independent else f"从数据集中划出的{name}比例")
 
     def _load_state(self) -> tuple[ExperimentConfig, dict]:
-        """返回 (训练配置, 参数遍历页的设置)。"""
+        """返回 (训练配置, 整个状态字典：其中 sweep / evaluate 为参数遍历页、模型评估页的设置)。"""
         cfg = ExperimentConfig(output_dir=str(PROJECT_ROOT / "runs"))
         if STATE_PATH.exists():
             try:
                 state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-                sweep = state.get("sweep")
-                return ExperimentConfig.from_dict(state.get("config", {})), sweep if isinstance(sweep, dict) else {}
+                return ExperimentConfig.from_dict(state.get("config", {})), state
             except (OSError, ValueError, AttributeError) as exc:
                 self._log(f"上次的训练配置无法读取，使用默认配置：{exc}")
                 return cfg, {}
@@ -830,7 +796,15 @@ class TrainWindow(QMainWindow):
             return
         try:
             STATE_PATH.write_text(
-                json.dumps({"config": cfg.to_dict(), "sweep": self.sweep_panel.state()}, ensure_ascii=False, indent=2),
+                json.dumps(
+                    {
+                        "config": cfg.to_dict(),
+                        "sweep": self.sweep_panel.state(),
+                        "evaluate": self.evaluate_panel.state(),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
                 encoding="utf-8",
             )
         except OSError as exc:
@@ -983,8 +957,18 @@ class TrainWindow(QMainWindow):
     # ------------------------------------------------------------------ 结果展示
     def _open_run_dialog(self) -> None:
         start = self.output_edit.text() or str(PROJECT_ROOT / "runs")
-        folder = QFileDialog.getExistingDirectory(self, "选择训练结果或参数遍历结果文件夹", start)
+        folder = QFileDialog.getExistingDirectory(self, "选择训练结果、参数遍历结果或模型评估结果文件夹", start)
         if not folder:
+            return
+        if is_evaluation_dir(folder):
+            try:
+                evaluation = load_evaluation(folder)
+            except (OSError, ValueError) as exc:
+                QMessageBox.warning(self, "打开失败", str(exc))
+                return
+            self.evaluate_panel.show_record(evaluation)
+            self.tabs.setCurrentWidget(self.evaluate_panel)
+            self._log(f"已打开模型评估结果：{folder}")
             return
         if is_sweep_dir(folder):
             try:
@@ -1054,71 +1038,19 @@ class TrainWindow(QMainWindow):
             self.history_table.scrollToBottom()
 
     def _show_evaluation(self, run: RunRecord | None) -> None:
-        self.summary_table.setRowCount(0)
-        self.point_table.setRowCount(0)
-        self.open_run_btn.setEnabled(run is not None)
         if run is None:
-            self.run_label.setText("训练完成后在这里显示最佳模型在各数据集上的表现")
-            self.eval_chart.update_scores({})
+            self.eval_page.clear()
             return
         m = run.metrics
         state = "（手动停止）" if m.get("stopped") else "（提前停止）" if m.get("early_stopped") else ""
         best = m.get("best_epoch", 0)
         used = f"使用第 {best} 个 epoch 的模型" if best else "没有完成任何 epoch，模型为初始参数"
-        self.run_label.setText(
+        header = (
             f"{run.path}\n共训练 {m.get('epochs_run', len(run.history))} 个 epoch{state}，{used}，"
             f"{m.get('num_parameters', 0):,} 个参数，{len(m.get('features', []))} 个输入特征"
         )
-        sources = m.get("sources", {})
-        for name, values in m.get("splits", {}).items():
-            self._add_summary_row(SPLIT_NAMES.get(name, name), values)
-            for source, source_values in sources.get(name, {}).items():  # 来自多个文件夹时逐个列出
-                self._add_summary_row(f"    └ {source}", source_values)
-        self._fit_summary_height(self.summary_table.rowCount())
-        self.eval_chart.update_scores(split_scores(run.predictions))
-
-        table = per_point_accuracy(run.predictions)
-        if not table.empty:
-            shown = table[table["split"] != "train"]
-            for rec in (shown if not shown.empty else table).itertuples(index=False):
-                row = self.point_table.rowCount()
-                self.point_table.insertRow(row)
-                cells = [
-                    SPLIT_NAMES.get(rec.split, rec.split),
-                    getattr(rec, "source", ""),
-                    rec.scene,
-                    rec.point,
-                    CLASS_NAMES.get(rec.label, rec.label),
-                    f"{rec.samples:,}",
-                    f"{rec.accuracy:.1%}",
-                    f"{rec.mean_prob:.3f}",
-                ]
-                for col, text in enumerate(cells):
-                    item = QTableWidgetItem(str(text))
-                    if rec.accuracy < 0.8:
-                        item.setBackground(WARN_BG)
-                    self.point_table.setItem(row, col, item)
+        self.eval_page.show_results(run.path, header, m, run.predictions)
         self.statusBar().showMessage(f"训练结果：{run.path}")
-
-    def _add_summary_row(self, label: str, values: dict) -> None:
-        row = self.summary_table.rowCount()
-        self.summary_table.insertRow(row)
-        cells = [label, f"{values.get('n', 0):,}", _fmt(values.get("loss"), "{:.4f}")]
-        cells += [_fmt(values.get(k), "{:.4f}" if k == "auc" else "{:.2%}") for k in METRIC_NAMES]
-        for col, text in enumerate(cells):
-            self.summary_table.setItem(row, col, QTableWidgetItem(text))
-
-    def _fit_summary_height(self, rows: int) -> None:
-        """指标表按行数调整高度，最多显示 8 行，再多时滚动。"""
-        visible = min(max(rows, 3), 8)
-        height = self.summary_table.verticalHeader().defaultSectionSize() * visible
-        self.summary_table.setFixedHeight(self.summary_table.horizontalHeader().sizeHint().height() + height + 4)
-        policy = Qt.ScrollBarPolicy.ScrollBarAsNeeded if rows > 8 else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        self.summary_table.setVerticalScrollBarPolicy(policy)
-
-    def _open_run_folder(self) -> None:
-        if self._run is not None:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._run.path)))
 
     # ------------------------------------------------------------------ 其他
     def _log(self, text: str) -> None:
@@ -1129,11 +1061,7 @@ class TrainWindow(QMainWindow):
             self._worker.stop()
             self._cleanup_worker()
         self.sweep_panel.shutdown()
+        self.evaluate_panel.shutdown()
         self._save_state()
         super().closeEvent(event)
 
-
-def _fmt(value, pattern: str) -> str:
-    if value is None or (isinstance(value, float) and math.isnan(value)):
-        return "—"
-    return pattern.format(value)

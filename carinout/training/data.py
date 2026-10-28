@@ -297,9 +297,10 @@ def prepare_data(cfg: DataConfig, seed: int, log: Callable[[str], None] | None =
         log(note)
     return PreparedData(
         features, splits["train"], splits["val"], splits["test"], fill_values, scaler, notes,
-        train_files=[str(p) for p in train_files],
-        val_files=[str(p) for p in extra["val"]],
-        test_files=[str(p) for p in extra["test"]],
+        # 记录绝对路径：保存到训练结果后，换个工作目录打开也能找到
+        train_files=[str(p.resolve()) for p in train_files],
+        val_files=[str(p.resolve()) for p in extra["val"]],
+        test_files=[str(p.resolve()) for p in extra["test"]],
     )
 
 

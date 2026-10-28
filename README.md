@@ -5,7 +5,8 @@
 1. [数据集构建工具](#数据集构建工具)（`python main.py`）：把采集到的各锚点（SLAVE）CSV 按点位整合成带标签的数据集。
 2. [模型训练平台](#模型训练平台)（`python train.py`）：在一个或多个数据集文件夹上训练车内 / 车外二分类模型（默认 3 层 MLP），
    实时显示损失曲线和评价指标；
-   支持[参数遍历](#参数遍历)，多进程并行训练多组超参数并比较。
+   支持[参数遍历](#参数遍历)，多进程并行训练多组超参数并比较；
+   可以[用已有模型评估](#用已有模型评估)新的验证集 / 测试集，查看每个场景、每个点位的准确率。
 
 ## 数据集构建工具
 
@@ -109,6 +110,7 @@ python train.py                                # 图形界面
 python train.py --config configs/mlp.json      # 命令行训练（参数见 python train.py --help）
 python train.py --dataset D:/data/merged/1023采集 --dataset D:/data/merged/1024采集 \
                 --val-dataset D:/data/merged/1025采集        # 多个训练 / 验证文件夹
+python train.py --evaluate runs/20261027-153012_mlp --test-dataset D:/data/merged/1026采集   # 用已有模型评估
 ```
 
 只用 CPU 训练时，可以先装 CPU 版 PyTorch，下载量小很多：
@@ -186,11 +188,41 @@ python train.py --dataset D:/data/merged/1023采集 --dataset D:/data/merged/102
 - **损失曲线**：总损失、交叉熵、L2 正则项三张图，训练集与验证集对比，竖线标出最佳 epoch。
   鼠标移到图上显示该 epoch 的数值；工具栏可缩放、平移、保存图片。
 - **评价指标**：验证集的准确率、精确率、召回率、F1、AUC 随 epoch 的变化。
-- **评估结果**：最佳模型在训练 / 验证 / 测试集上的指标表（独立验证集 / 测试集有多个文件夹时，逐个文件夹列出），
-  验证集和测试集的混淆矩阵、ROC 曲线，以及**各点位的准确率**（含来源文件夹，从低到高，准确率低于 80% 标黄），
-  方便找出容易判错的位置。
+- **评估结果**：上方是最佳模型在训练 / 验证 / 测试集上的指标表（数据来自多个文件夹时逐个文件夹列出），下方分页：
+  - **各场景准确率**：验证集、测试集中每个场景（如“中间座椅+脚坑”）的点位数、样本数、准确率和平均车内概率，
+    各集合内从低到高排列，低于 80% 标黄；
+  - **各点位准确率**：每个点位（含来源文件夹）的准确率，从低到高，方便找出容易判错的位置；
+  - **混淆矩阵与 ROC**：验证集、测试集的混淆矩阵和 ROC 曲线。
 - **训练记录**：每个 epoch 的全部数值，最佳 epoch 一行高亮。
 - **打开训练结果…**：重新查看以前某次训练的曲线和评估结果，并把它的配置载入左侧，方便对比、微调后再训练。
+  也能打开参数遍历结果和模型评估结果。
+
+### 用已有模型评估
+
+![模型评估](docs/train_evaluate.png)
+
+用训练好的模型评估新的数据（例如之后几天采集的数据），**不重新训练**：
+
+1. 打开“模型评估”页，选择模型：点“浏览…”选训练结果文件夹（含 `model.pt`，参数遍历中某一组的文件夹也可以），
+   或点“用当前训练结果”使用刚训练完 / 正在查看的那个。下方会显示模型结构、输入特征数和它的训练数据。
+2. 添加验证集、测试集文件夹（各自可以有多个，用法同左侧的数据集列表），点“开始评估”。
+3. 结果与“评估结果”页相同：指标表（逐个文件夹列出）、**各场景准确率**、各点位准确率、混淆矩阵与 ROC。
+
+- 模型按训练时的方式选取特征、填充缺失值、标准化，新数据只需包含训练时用到的特征列。
+  模型训练时选择“丢弃含缺失值的行”的话，特征有缺失的行不参与评估，提示中会写明行数。
+- 评估数据中如果有该模型的训练数据，会提示“指标会偏乐观”。
+- 结果保存在模型所在文件夹的 `eval_时间/` 子文件夹中：`evaluation.json`（指标，含各文件夹、各场景的准确率）、
+  `predictions.csv`（每行的车内概率和预测，格式同训练结果）、`evaluation.png`；可以用“打开训练结果…”重新查看。
+- 模型训练好之后，“验证集”和“测试集”只是名称不同，评估方法完全一样，分开填便于分别看结果。
+
+命令行：
+
+```bash
+python train.py --evaluate runs/20261027-153012_mlp \
+    --val-dataset D:/data/merged/1025采集 --val-dataset D:/data/merged/1026采集 --test-dataset D:/data/merged/1027采集
+```
+
+输出各集合（及各文件夹）的指标和各场景准确率，结果同样保存在 `eval_时间/` 中。训练结束时命令行也会列出各场景准确率。
 
 ### 参数遍历
 
@@ -248,12 +280,13 @@ python train.py --config configs/mlp.json --workers 8 \
 | --- | --- |
 | `config.json` | 本次完整配置（`features` 为实际使用的特征，训练数据 / 验证集 / 测试集为实际使用的文件），`python train.py --config` 可直接复现 |
 | `history.csv` | 每个 epoch 的损失与验证集指标 |
-| `metrics.json` | 最佳模型在各数据集上的指标、混淆矩阵 `[[TN, FP], [FN, TP]]`、按文件夹的指标（`sources`），以及数据划分说明 |
+| `metrics.json` | 最佳模型在各数据集上的指标、混淆矩阵 `[[TN, FP], [FN, TP]]`、按文件夹的指标（`sources`）、各场景准确率（`scenes`），以及数据划分说明 |
 | `predictions.csv` | 每个样本的 `split, source`（来自哪个文件夹）`, ts, scene, point, label, prob`（车内概率）`, pred` |
 | `model.pt` | 模型参数 + 特征列表 + 缺失值填充值 + 标准化参数 |
 | `loss.png` / `metrics.png` / `evaluation.png` | 图表 |
+| `eval_时间/` | 之后用该模型做的评估（见[用已有模型评估](#用已有模型评估)） |
 
-用训练好的模型推理（会按训练时的方式选特征、填充缺失值、标准化）：
+在自己的代码中用训练好的模型推理（会按训练时的方式选特征、填充缺失值、标准化）：
 
 ```python
 from carinout.training.data import load_table
@@ -275,9 +308,11 @@ carinout/training/
   metrics.py   准确率 / 精确率 / 召回率 / F1 / AUC / ROC / 混淆矩阵
   plots.py     图表（界面与 PNG 共用）
   runs.py      训练结果保存 / 读取，Predictor 推理
-  sweep.py     参数遍历：网格组合、多进程并行训练、结果汇总
+  evaluate.py  用已有模型评估新的验证集 / 测试集
+  sweep.py     参数遍历：网格组合、多进程并行训练、结果汇总（sweep_worker.py 为训练进程）
   cli.py       命令行
-carinout/gui/train_window.py, train_charts.py, sweep_panel.py   界面
+carinout/gui/  train_window.py（主窗口）、evaluation_view.py（评估结果展示）、evaluate_panel.py（模型评估页）、
+               sweep_panel.py（参数遍历页）、dataset_list.py（文件夹列表）、train_charts.py（图表）
 ```
 
 模型只需满足：`nn.Module`，输入 `(batch, 特征数)`，输出 `(batch, 2)` 的 logits。新增一种模型：

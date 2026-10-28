@@ -1,5 +1,6 @@
 """命令行训练：python train.py --config 配置.json [覆盖参数...]
 参数遍历：python train.py --config 配置.json --sweep bs=32,64 --sweep lr=1e-3,3e-4 --sweep hidden1=32,64 --workers 8
+用已有模型评估：python train.py --evaluate 训练结果文件夹 --val-dataset 文件夹 --test-dataset 文件夹
 
 不带任何参数运行 train.py 时打开图形界面；带参数时在命令行训练，结果与界面训练相同（保存在 output_dir 下）。
 """
@@ -13,8 +14,10 @@ import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 
+import pandas as pd
+
 from .config import ExperimentConfig
-from .data import SPLIT_NAMES, feature_candidates, load_table, resolve_datasets
+from .data import CLASS_NAMES, SPLIT_NAMES, feature_candidates, load_table, resolve_datasets
 from .metrics import METRIC_NAMES
 from .models import available_models, get_spec
 from .sweep import RANK_METRICS, default_workers
@@ -74,6 +77,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--workers", type=int, default=default_workers(), help="并行训练的进程数（默认约为物理核数，最多 8 个）"
     )
     g.add_argument("--rank-by", choices=list(RANK_METRICS), default="val_accuracy", help="挑选最佳组合的验证集指标")
+    e = p.add_argument_group("用已有模型评估（不训练）")
+    e.add_argument(
+        "--evaluate",
+        metavar="训练结果文件夹",
+        help="用该文件夹中的模型评估 --val-dataset / --test-dataset 指定的数据，结果保存在其中的 eval_时间 文件夹",
+    )
     return p
 
 
@@ -124,6 +133,8 @@ def apply_args(cfg: ExperimentConfig, args: argparse.Namespace) -> ExperimentCon
 def main(argv: list[str]) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.evaluate:
+            return _evaluate(args)
         cfg = ExperimentConfig.load(args.config) if args.config else ExperimentConfig()
         cfg = apply_args(cfg, args)
         if args.list_features:
@@ -147,7 +158,7 @@ def _list_features(cfg: ExperimentConfig) -> int:
 
 def _train(cfg: ExperimentConfig) -> int:
     from .data import prepare_data
-    from .runs import new_run_dir, per_source_metrics, predictions_frame, save_run
+    from .runs import new_run_dir, predictions_frame, save_run
     from .trainer import fit
 
     data = prepare_data(cfg.data, cfg.train.seed, log=print)
@@ -171,16 +182,53 @@ def _train(cfg: ExperimentConfig) -> int:
     save_run(run_dir, cfg, data, result)
 
     print(f"\n最佳 epoch：{result.best_epoch}")
-    print(f"{'':<16}{'样本数':>8}{'交叉熵':>10}" + "".join(f"{name:>10}" for name in METRIC_NAMES.values()))
-    sources = per_source_metrics(predictions_frame(data, result))
-    for name, ev in result.evals.items():
-        values = "".join(f"{ev.metrics[k]:>10.4f}" for k in METRIC_NAMES)
-        print(f"{SPLIT_NAMES[name]:<16}{ev.metrics['n']:>8}{ev.loss:>10.4f}{values}")
-        for source, m in sources.get(name, {}).items():  # 来自多个文件夹时逐个列出
-            values = "".join(f"{_num(m[k]):>10}" for k in METRIC_NAMES)
-            print(f"  {source:<14}{m['n']:>8}{'':>10}{values}")
+    splits = {name: {"loss": ev.loss, **ev.metrics} for name, ev in result.evals.items()}
+    _print_results(splits, predictions_frame(data, result))
     print(f"\n训练结果已保存到 {run_dir}")
     return 0
+
+
+def _evaluate(args: argparse.Namespace) -> int:
+    from .evaluate import evaluate_model, save_evaluation_figure
+
+    if args.dataset:
+        raise ValueError("评估已有模型时用 --val-dataset / --test-dataset 指定数据（--dataset 是训练数据）")
+    record = evaluate_model(args.evaluate, args.val_dataset or [], args.test_dataset or [], log=print)
+    save_evaluation_figure(record)
+    print()
+    _print_results(record.metrics["splits"], record.predictions)
+    return 0
+
+
+def _print_results(splits: dict[str, dict], predictions) -> None:
+    """各集合的指标（数据来自多个文件夹时逐个列出），以及验证集、测试集各场景的准确率。"""
+    from .runs import per_scene_accuracy, per_source_metrics
+
+    print(f"{'':<16}{'样本数':>8}{'交叉熵':>10}" + "".join(f"{name:>10}" for name in METRIC_NAMES.values()))
+    sources = per_source_metrics(predictions)
+    for name, m in splits.items():
+        values = "".join(f"{_num(m[k]):>10}" for k in METRIC_NAMES)
+        print(f"{SPLIT_NAMES[name]:<16}{m['n']:>8}{_num(m.get('loss')):>10}{values}")
+        for source, sm in sources.get(name, {}).items():
+            values = "".join(f"{_num(sm[k]):>10}" for k in METRIC_NAMES)
+            print(f"  {source:<14}{sm['n']:>8}{'':>10}{values}")
+
+    scenes = per_scene_accuracy(predictions)
+    if scenes.empty:
+        return
+    shown = scenes[scenes["split"] != "train"]
+    shown = shown if not shown.empty else scenes
+    table = pd.DataFrame({
+        "数据集": shown["split"].map(SPLIT_NAMES),
+        "场景": shown["scene"],
+        "真实类别": shown["label"].map(CLASS_NAMES),
+        "点位数": shown["points"] if "points" in shown else "",
+        "样本数": shown["samples"],
+        "准确率": shown["accuracy"].map(lambda v: f"{v:.2%}"),
+        "平均车内概率": shown["mean_prob"].map(lambda v: f"{v:.3f}"),
+    })
+    print("\n各场景准确率：")
+    print(table.to_string(index=False))
 
 
 def _sweep(cfg: ExperimentConfig, args: argparse.Namespace) -> int:

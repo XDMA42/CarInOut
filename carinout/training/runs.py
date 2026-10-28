@@ -3,7 +3,7 @@
 每次训练在 output_dir 下新建一个文件夹，例如 runs/20261027-153012_mlp/：
   config.json       完整配置（features 为实际使用的特征），可直接加载后复现
   history.csv       每个 epoch 的损失与验证集指标
-  metrics.json      最佳模型在训练 / 验证 / 测试集上的指标与混淆矩阵
+  metrics.json      最佳模型在训练 / 验证 / 测试集上的指标与混淆矩阵，按文件夹、按场景的准确率
   predictions.csv   每个样本的 split、source（来自哪个文件夹）、ts、scene、point、label、车内概率 prob、预测 pred
   model.pt          模型参数 + 特征列表 + 缺失值填充值 + 标准化参数（Predictor 加载）
   loss.png / metrics.png / evaluation.png
@@ -44,7 +44,11 @@ TRUE_COLUMN = "label"
 def new_run_dir(cfg: ExperimentConfig) -> Path:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     suffix = re.sub(r'[\\/:*?"<>|\s]+', "_", cfg.run_name.strip()) or cfg.model.name
-    base = Path(cfg.output_dir) / f"{stamp}_{suffix}"
+    return unique_dir(Path(cfg.output_dir) / f"{stamp}_{suffix}")
+
+
+def unique_dir(base: Path) -> Path:
+    """新建文件夹；已存在时在名称后加 _2、_3 …"""
     path, i = base, 1
     while path.exists():
         i += 1
@@ -98,10 +102,11 @@ def save_run(
         "features": list(data.features),
         "splits": {name: {"loss": ev.loss, **ev.metrics} for name, ev in result.evals.items()},
         "sources": per_source_metrics(predictions),
+        "scenes": per_scene_accuracy(predictions).to_dict("records"),
         "notes": data.notes,
     }
     (run_dir / METRICS_FILE).write_text(
-        json.dumps(_json_safe(metrics), ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(json_safe(metrics), ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
     torch.save(
@@ -137,13 +142,14 @@ def load_run(path: str | Path) -> RunRecord:
     config = ExperimentConfig.load(path / CONFIG_FILE)
     history = pd.read_csv(path / HISTORY_FILE)
     metrics = json.loads((path / METRICS_FILE).read_text(encoding="utf-8")) if (path / METRICS_FILE).is_file() else {}
-    pred_path = path / PREDICTIONS_FILE
-    predictions = (
-        pd.read_csv(pred_path, encoding="utf-8-sig", dtype={c: str for c in META_COLUMNS}, keep_default_na=False)
-        if pred_path.is_file()
-        else pd.DataFrame()
-    )
-    return RunRecord(path, config, history, metrics, predictions)
+    return RunRecord(path, config, history, metrics, read_predictions(path / PREDICTIONS_FILE))
+
+
+def read_predictions(path: Path) -> pd.DataFrame:
+    """读取 predictions.csv（文件不存在时返回空表），ts / scene / point 等按文本读取。"""
+    if not path.is_file():
+        return pd.DataFrame()
+    return pd.read_csv(path, encoding="utf-8-sig", dtype={c: str for c in META_COLUMNS}, keep_default_na=False)
 
 
 def save_run_figures(run: RunRecord) -> None:
@@ -177,6 +183,19 @@ def per_source_metrics(predictions: pd.DataFrame) -> dict[str, dict[str, dict]]:
     return result
 
 
+def per_scene_accuracy(predictions: pd.DataFrame) -> pd.DataFrame:
+    """按 (split, scene) 统计点位数、样本数和准确率；各集合内准确率低的在前。"""
+    if predictions.empty or SCENE_COLUMN not in predictions:
+        return pd.DataFrame()
+    df = predictions.assign(correct=predictions[PRED_COLUMN] == predictions[TRUE_COLUMN])
+    agg = {"samples": ("correct", "size"), "accuracy": ("correct", "mean"), "mean_prob": (PROB_COLUMN, "mean")}
+    if POINT_COLUMN in df:
+        agg["points"] = (POINT_COLUMN, "nunique")  # 不同文件夹中的同名点位视为同一位置
+    table = df.groupby([SPLIT_COLUMN, SCENE_COLUMN, TRUE_COLUMN], sort=False).agg(**agg).reset_index()
+    table["_order"] = table[SPLIT_COLUMN].map({name: i for i, name in enumerate(SPLITS)})
+    return table.sort_values(["_order", "accuracy"], kind="stable").drop(columns="_order").reset_index(drop=True)
+
+
 def per_point_accuracy(predictions: pd.DataFrame) -> pd.DataFrame:
     """按 (split, source, scene, point) 统计样本数和准确率，准确率低的在前，用于找出容易判错的点位。"""
     if predictions.empty or not {SCENE_COLUMN, POINT_COLUMN} <= set(predictions.columns):
@@ -196,6 +215,9 @@ class Predictor:
     """加载 model.pt，对总表格式的数据输出车内概率（与训练时相同的特征、填充和标准化）。"""
 
     def __init__(self, checkpoint: dict) -> None:
+        self.model_name: str = checkpoint["model"]
+        self.params: dict = dict(checkpoint["params"])
+        self.num_classes: int = checkpoint["num_classes"]
         self.features: list[str] = list(checkpoint["features"])
         self.fill_values = _array(checkpoint["fill_values"])
         self.mean = _array(checkpoint["scaler_mean"])
@@ -212,6 +234,10 @@ class Predictor:
         if path.is_dir():
             path = path / MODEL_FILE
         return cls(torch.load(path, map_location="cpu", weights_only=True))
+
+    def describe(self) -> str:
+        """模型结构说明，如 “3 层全连接：10 → 64 → 32 → 2（隐藏层 ReLU），共 2,850 个参数”。"""
+        return get_spec(self.model_name).summary(len(self.features), self.num_classes, self.params)
 
     @torch.no_grad()
     def predict_proba(self, df: pd.DataFrame) -> np.ndarray:
@@ -236,13 +262,14 @@ def _array(values) -> np.ndarray | None:
     return None if values is None else np.asarray(values, dtype=np.float64)
 
 
-def _json_safe(value):
+def json_safe(value):
+    """转为可写入 JSON 的值：NaN / inf → null，numpy 标量 → Python 数值。"""
     if isinstance(value, float) and not math.isfinite(value):
         return None
     if isinstance(value, dict):
-        return {k: _json_safe(v) for k, v in value.items()}
+        return {k: json_safe(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_json_safe(v) for v in value]
+        return [json_safe(v) for v in value]
     if isinstance(value, np.generic):
-        return _json_safe(value.item())
+        return json_safe(value.item())
     return value

@@ -21,8 +21,10 @@ def make_dataset(
     missing_rate: float = 0.0,
     noise: float = 3.0,
     body_loss: float = 6.0,
+    sub_scenes: bool = False,
 ) -> Path:
-    """车内点位 label=1，车外点位 label=0；RSSI 按距离衰减，信号穿过车身时额外衰减。"""
+    """车内点位 label=1，车外点位 label=0；RSSI 按距离衰减，信号穿过车身时额外衰减。
+    sub_scenes 为 True 时按位置细分场景：车内分前排 / 后排，车外分近处（1 米内）/ 远处。"""
     rng = np.random.default_rng(seed)
     anchors = [(s.default_name, s.x * CAR_W, s.y * CAR_L, s.inside) for s in ANCHOR_SLOTS]
     frames = []
@@ -30,10 +32,12 @@ def make_dataset(
         for k in range(count):
             if label:
                 px, py = rng.uniform(0.2, CAR_W - 0.2), rng.uniform(0.6, CAR_L - 0.6)
+                sub = "前排座椅" if py < CAR_L / 2 else "后排座椅"
             else:
                 angle, dist = rng.uniform(0, 2 * np.pi), rng.uniform(0.3, 2.5)
                 px = CAR_W / 2 + np.cos(angle) * (CAR_W / 2 + dist)
                 py = CAR_L / 2 + np.sin(angle) * (CAR_L / 2 + dist)
+                sub = "车外近处" if dist < 1.0 else "车外远处"
             ts = np.arange(rows_per_point) * 100 + 1000 * k
             row = {"ts": ts.astype(str)}
             for name, ax, ay, inside in anchors:
@@ -46,7 +50,8 @@ def make_dataset(
                 row[f"rssi_{name}"] = text
                 row[f"errcode_{name}"] = "0"
             frame = pd.DataFrame(row)
-            frame["scene"], frame["point"], frame["label"] = scene, str(k + 1), str(label)
+            frame["scene"] = sub if sub_scenes else scene
+            frame["point"], frame["label"] = str(k + 1), str(label)
             frames.append(frame)
     pd.concat(frames, ignore_index=True).to_csv(path, index=False, encoding="utf-8-sig")
     return path
