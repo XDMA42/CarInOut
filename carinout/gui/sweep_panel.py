@@ -48,6 +48,7 @@ from ..training.sweep import (
     Trial,
     available_axes,
     best_trial,
+    default_workers,
     expand_grid,
     load_sweep,
     run_sweep,
@@ -171,11 +172,12 @@ class SweepPanel(QWidget):
         cpus = os.cpu_count() or 1
         self.workers_spin = QSpinBox()
         self.workers_spin.setRange(1, cpus)
-        self.workers_spin.setValue(cpus)
+        self.workers_spin.setValue(default_workers())
         self.workers_spin.setSuffix(f" / {cpus} 个 CPU 核")
         self.workers_spin.setToolTip(
             "同时训练的组合数，每个组合在独立的进程中训练（不受 Python GIL 限制，能用满多个 CPU 核）。\n"
-            "每个进程约占几百 MB 内存，内存紧张时调小。"
+            "每个进程约占几百 MB 到 1 GB 以上内存（安装了 GPU 版 PyTorch 时更多），内存紧张时调小。\n"
+            "训练中有进程意外退出时，会自动减少并行进程数并重试该组合。"
         )
         self.rank_combo = QComboBox()
         for key, label in RANK_METRICS.items():
@@ -363,9 +365,11 @@ class SweepPanel(QWidget):
         if row is None or row["status"] in FINAL_STATUSES:  # 进程中晚到的 epoch 消息
             return
         if kind == "start":
-            self._set_status(index, f"{STATUS_RUNNING} 0/{self._epochs[index]}")
+            self._set_status(index, f"{STATUS_RUNNING} 0/{self._epochs[index]}", STATUS_RUNNING)
         elif kind == "epoch":
-            self._set_status(index, f"{STATUS_RUNNING} {event[2]['epoch']}/{self._epochs[index]}")
+            self._set_status(index, f"{STATUS_RUNNING} {event[2]['epoch']}/{self._epochs[index]}", STATUS_RUNNING)
+        elif kind == "retry":  # 训练进程意外退出，稍后重试
+            self._set_status(index, "等待重试（训练进程意外退出）", STATUS_PENDING)
         elif kind == "done":
             row.update(event[2])
             self._fill_row(self._row_of(index), row)
@@ -479,11 +483,12 @@ class SweepPanel(QWidget):
                 item.setToolTip(text)  # 状态列可能带有较长的失败原因
             self.table.setItem(r, c, item)
 
-    def _set_status(self, index: int, text: str) -> None:
+    def _set_status(self, index: int, text: str, status: str) -> None:
         item = self.table.item(self._row_of(index), 1 + len(self._keys))
         if item is not None:
             item.setText(text)
-        self._rows[index]["status"] = STATUS_RUNNING
+            item.setToolTip(text)
+        self._rows[index]["status"] = status
 
     def _row_of(self, index: int) -> int:
         for r in range(self.table.rowCount()):

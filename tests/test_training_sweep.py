@@ -1,4 +1,8 @@
 import math
+import multiprocessing as mp
+import os
+import signal
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -6,7 +10,7 @@ import pandas as pd
 import pytest
 import torch
 
-from carinout.training import plots
+from carinout.training import plots, sweep
 from carinout.training.cli import main as cli_main
 from carinout.training.config import DataConfig, ExperimentConfig, ModelConfig, OptimConfig
 from carinout.training.runs import load_run
@@ -141,6 +145,56 @@ def test_stop_and_failure(base: ExperimentConfig):
     path = run_sweep(base, expand_grid(base, {"train.batch_size": [16, 32]}), workers=2)
     results = load_sweep(path).results
     assert results["status"].eq(STATUS_FAILED).all() and results["error"].str.contains("CUDA").all()
+
+
+def test_crashed_worker_only_affects_its_trial(base: ExperimentConfig):
+    """一个训练进程意外退出（如内存不足被系统结束）：它的组合重试一次，其他组合照常完成，不会全部失败。"""
+    base.train.epochs = 20
+    trials = expand_grid(base, {"train.batch_size": [16, 32, 64]})
+    logs, killed = [], []
+
+    def on_event(event):
+        if event[0] == "epoch" and not killed:  # 两个进程都在训练时杀掉其中一个
+            victim = mp.active_children()[0]
+            victim.kill()
+            killed.append(victim.pid)
+
+    path = run_sweep(base, trials, workers=2, on_event=on_event, log=logs.append)
+    assert killed and load_sweep(path).results["status"].eq(STATUS_DONE).all()
+    assert any("稍后重试" in m for m in logs) and any("进程数减为 1" in m for m in logs)
+    assert not mp.active_children()
+
+
+def test_worker_startup_failure_is_reported(base: ExperimentConfig, monkeypatch):
+    """子进程启动失败时显示真正的原因，有限次重启后结束，不会卡住。"""
+    monkeypatch.setattr(sweep.pickle, "dump", lambda obj, fh, **kw: fh.write(b"broken"))
+    monkeypatch.setattr(sweep, "MAX_RESTARTS", 1)
+    logs = []
+    path = run_sweep(base, expand_grid(base, {"train.batch_size": [16, 32]}), workers=2, log=logs.append)
+    results = load_sweep(path).results
+    assert results["status"].eq(STATUS_FAILED).all()
+    assert results["error"].str.contains("UnpicklingError").all()
+    assert any("训练进程启动失败" in m for m in logs)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="需要 SIGSTOP")
+def test_stop_does_not_hang_on_unresponsive_worker(base: ExperimentConfig, monkeypatch):
+    """停止时某个进程没有响应：超时后强制结束，遍历照常返回。"""
+    monkeypatch.setattr(sweep, "STOP_TIMEOUT", 3.0)
+    base.train.epochs = 500
+    state = {"stop": False}
+
+    def on_event(event):
+        if event[0] == "epoch" and not state["stop"]:
+            os.kill(mp.active_children()[0].pid, signal.SIGSTOP)
+            state["stop"] = True
+
+    path = run_sweep(base, expand_grid(base, {"train.batch_size": [16, 32]}), workers=2, on_event=on_event,
+                     should_stop=lambda: state["stop"])
+    results = load_sweep(path).results
+    assert results["status"].eq(STATUS_STOPPED).all()
+    assert results["error"].fillna("").str.contains("停止超时").any()
+    assert not mp.active_children()
 
 
 def test_cli_sweep(base: ExperimentConfig, tmp_path: Path, capsys):

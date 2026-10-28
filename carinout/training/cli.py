@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import os
 import signal
 import sys
 from collections.abc import Callable, Iterator
@@ -18,7 +17,7 @@ from .config import ExperimentConfig
 from .data import SPLIT_NAMES, feature_candidates, load_table, resolve_datasets
 from .metrics import METRIC_NAMES
 from .models import available_models, get_spec
-from .sweep import RANK_METRICS
+from .sweep import RANK_METRICS, default_workers
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -71,7 +70,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="可重复。参数：bs（batch size）、lr、l2、epochs、hidden1 / hidden2 …（第 N 层隐藏层节点数）、"
         "dropout，如 --sweep bs=32,64 --sweep hidden1=32,64,128 --sweep dropout=0,0.2",
     )
-    g.add_argument("--workers", type=int, default=os.cpu_count() or 1, help="并行训练的进程数（默认 CPU 核数）")
+    g.add_argument(
+        "--workers", type=int, default=default_workers(), help="并行训练的进程数（默认约为物理核数，最多 8 个）"
+    )
     g.add_argument("--rank-by", choices=list(RANK_METRICS), default="val_accuracy", help="挑选最佳组合的验证集指标")
     return p
 

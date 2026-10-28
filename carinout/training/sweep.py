@@ -3,6 +3,10 @@
 用进程而不是线程并行：小型 MLP 每个 batch 的耗时主要是 Python 代码，线程受 GIL 限制几乎不能同时运行。
 数据只准备一次（读取、划分、标准化），写到临时文件，各进程启动时读入，之后依次训练分配给它的组合。
 
+进程池是自己管理的（见 _Pool 和 sweep_worker.py），而不是 ProcessPoolExecutor：后者在任一进程意外退出时
+会结束所有进程、让全部组合失败，共享的锁和队列还可能让停止操作卡住。这里一个进程退出只影响它正在训练的组合
+（重试一次），同时并行的进程数减一；停止时最多等待 STOP_TIMEOUT 秒，超时强制结束进程。
+
 结果目录，例如 runs/20261027-160000_sweep/：
   sweep.json       基础配置、遍历的参数及候选值、各组合的参数
   results.csv      每个组合一行：参数取值、状态、最佳 epoch、训练 / 验证 / 测试集指标、耗时（每完成一组就更新）
@@ -17,15 +21,14 @@ import math
 import multiprocessing as mp
 import os
 import pickle
-import queue as queue_module
 import re
-import signal
 import sys
 import tempfile
 import time
+from collections import deque
 from collections.abc import Callable
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass
+from multiprocessing import connection
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +40,7 @@ from .data import SPLITS, PreparedData, prepare_data
 from .models import get_spec
 from .models.base import KIND_CHOICE, KIND_FLOAT, KIND_INT, KIND_INT_LIST
 from .runs import new_run_dir, save_run
+from .sweep_worker import last_line, worker_main
 from .trainer import TrainResult, fit
 
 SWEEP_FILE = "sweep.json"
@@ -49,6 +53,18 @@ STATUS_STOPPED = "已停止"
 STATUS_FAILED = "失败"
 STATUS_CANCELLED = "未运行"
 FINAL_STATUSES = (STATUS_DONE, STATUS_STOPPED, STATUS_FAILED, STATUS_CANCELLED)
+
+STOP_TIMEOUT = 30.0  # 停止后等待正在训练的组合保存结果的最长时间（秒），超时强制结束进程
+MAX_RESTARTS = 3  # 所有进程都已退出、还有组合没训练时，最多重新启动进程的次数
+CRASH_HINT = (
+    "常见原因是内存不足，可以调小“并行进程数”。Windows 上出现 WinError 1455（页面文件太小）时，"
+    "也可以增大虚拟内存，或改装只用 CPU 的 PyTorch（体积小得多）"
+)
+
+
+def default_workers() -> int:
+    """默认并行进程数：约等于物理核数（逻辑核数的一半），最多 8 个，避免占用过多内存。"""
+    return max(1, min((os.cpu_count() or 1) // 2, 8))
 
 # 用来比较各组合的指标；交叉熵越低越好，其余越高越好
 RANK_METRICS = {
@@ -225,38 +241,18 @@ def run_sweep(
     workers = max(1, min(workers, len(trials), 61 if sys.platform == "win32" else workers))  # Windows 上限 61
     threads = max(1, (os.cpu_count() or 1) // workers)
     log(f"共 {len(trials)} 组参数，{workers} 个进程并行（每个进程 {threads} 个计算线程）")
-    # spawn：Windows 只支持这种方式；Linux 上也避免 fork 带走界面和 torch 的线程状态
-    ctx = mp.get_context("spawn")
-    events = ctx.Queue()
-    stop = ctx.Event()
-    # 数据经文件传给子进程：直接放进 initargs 时，父进程要等每个子进程导入完模块才能把数据写进管道，进程只能逐个启动
+    if base.train.device == "auto" and torch.cuda.is_available():
+        log("“设备”为自动时，参数遍历在 CPU 上训练：多个进程同时使用 GPU 会占用大量显存和内存，小模型在 CPU 上也很快")
+    # 数据经文件传给子进程：直接作为进程参数传递时，父进程要等每个子进程导入完模块才能写入管道，进程只能逐个启动
     fd, data_file = tempfile.mkstemp(prefix="carinout_sweep_", suffix=".pkl")
     with os.fdopen(fd, "wb") as fh:
         pickle.dump(data, fh, protocol=pickle.HIGHEST_PROTOCOL)
     try:
-        with ProcessPoolExecutor(
-            max_workers=workers, mp_context=ctx, initializer=_init_worker, initargs=(data_file, events, stop, threads)
-        ) as pool:
-            futures = {
-                pool.submit(_run_trial, t.index, t.config.to_dict(), str(sweep_dir / t.name)): t for t in trials
-            }
-            pending = set(futures)
-            while pending:
-                done, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
-                _drain(events, on_event)
-                for future in done:
-                    rows[futures[future].index].update(_outcome(future))
-                    on_event(("done", futures[future].index, dict(rows[futures[future].index])))
-                if done:
-                    _write_results(sweep_dir, rows, keys)
-                if should_stop() and not stop.is_set():
-                    stop.set()
-                    for future in pending:
-                        future.cancel()
-                    log("正在停止：正在训练的组合会保存当前结果，其余组合不再运行")
+        # spawn：Windows 只支持这种方式；Linux 上也避免 fork 带走界面和 torch 的线程状态
+        pool = _Pool(mp.get_context("spawn"), data_file, threads, sweep_dir, rows, keys, on_event, log)
+        pool.run(trials, workers, should_stop)
     finally:
         os.unlink(data_file)
-    _drain(events, on_event)
     _write_results(sweep_dir, rows, keys)
     counts = pd.Series([r["status"] for r in rows.values()]).value_counts()
     summary = "，".join(f"{status} {counts[status]} 组" for status in FINAL_STATUSES if status in counts)
@@ -264,13 +260,196 @@ def run_sweep(
     return sweep_dir
 
 
-def _outcome(future) -> dict:
-    if future.cancelled():
-        return {"status": STATUS_CANCELLED}
-    exc = future.exception()
-    if exc is not None:  # 包括子进程意外退出（如内存不足）
-        return {"status": STATUS_FAILED, "error": str(exc) or repr(exc)}
-    return future.result()
+@dataclass
+class _Worker:
+    process: Any
+    conn: Any  # 与该进程通信的管道
+    ready: bool = False  # 已导入模块、读入数据
+    trial: Trial | None = None  # 正在训练的组合
+    error: str = ""  # 启动失败的原因
+
+
+class _Pool:
+    """训练进程池：分配组合、转发进度、处理进程意外退出和停止。"""
+
+    def __init__(
+        self,
+        ctx,
+        data_file: str,
+        threads: int,
+        sweep_dir: Path,
+        rows: dict[int, dict],
+        keys: list[str],
+        on_event: Callable[[tuple], None],
+        log: Callable[[str], None],
+    ) -> None:
+        self._ctx = ctx
+        self._data_file = data_file
+        self._threads = threads
+        self._sweep_dir = sweep_dir
+        self._rows = rows
+        self._keys = keys
+        self._on_event = on_event
+        self._log = log
+        self._stop_flag = ctx.RawValue("b", 0)  # 无锁：进程被强制结束时不会留下未释放的锁
+        self._workers: list[_Worker] = []
+        self._queue: deque[Trial] = deque()
+        self._retried: set[int] = set()
+        self._restarts = 0
+        self._last_error = ""
+        self._hinted = False
+        self._stop_time: float | None = None
+
+    def run(self, trials: list[Trial], size: int, should_stop: Callable[[], bool]) -> None:
+        self._queue.extend(trials)
+        for _ in range(size):
+            self._spawn()
+        try:
+            while self._queue or any(w.trial for w in self._workers):
+                if self._stop_time is None and should_stop():
+                    self._request_stop()
+                if self._stop_time is not None and time.monotonic() - self._stop_time > STOP_TIMEOUT:
+                    self._force_stop()
+                    break
+                self._assign()
+                self._poll()
+                self._reap()
+                if not self._workers and self._queue and not self._restart():
+                    break
+        finally:
+            self._shutdown()
+
+    def _spawn(self) -> None:
+        conn, child_conn = self._ctx.Pipe()
+        args = (child_conn, self._data_file, self._stop_flag, self._threads)
+        process = self._ctx.Process(target=worker_main, args=args, daemon=True)
+        process.start()
+        child_conn.close()
+        self._workers.append(_Worker(process, conn))
+
+    def _assign(self) -> None:
+        if self._stop_time is not None:
+            return
+        for worker in self._workers:
+            if worker.ready and worker.trial is None and self._queue:
+                worker.trial = self._queue.popleft()
+                cfg = worker.trial.config.to_dict()
+                if cfg["train"]["device"] == "auto":
+                    cfg["train"]["device"] = "cpu"
+                try:
+                    worker.conn.send((worker.trial.index, cfg, str(self._sweep_dir / worker.trial.name)))
+                except OSError:
+                    pass  # 进程已退出，由 _reap 处理
+
+    def _poll(self) -> None:
+        """等待任一进程发来消息或退出（最多 0.2 秒），读取所有消息。"""
+        handles = [w.conn for w in self._workers] + [w.process.sentinel for w in self._workers]
+        if handles:
+            connection.wait(handles, timeout=0.2)
+        for worker in self._workers:
+            self._read(worker)
+
+    def _read(self, worker: _Worker) -> None:
+        try:
+            while worker.conn.poll():
+                self._handle(worker, worker.conn.recv())
+        except (EOFError, OSError):
+            pass  # 进程已退出，由 _reap 处理
+
+    def _handle(self, worker: _Worker, message: tuple) -> None:
+        kind = message[0]
+        if kind == "ready":
+            worker.ready = True
+        elif kind == "init_error":
+            worker.error = last_line(message[1])
+            self._log("训练进程启动失败：\n" + message[1].rstrip())
+        elif kind in ("start", "epoch"):
+            self._on_event(message)
+        elif kind == "result":
+            index, row = message[1], message[2]
+            worker.trial = None
+            self._finish(index, row)
+
+    def _reap(self) -> None:
+        """处理意外退出的进程：它正在训练的组合重试一次，再次失败则标记失败；不补充新进程（并行数减一）。"""
+        for worker in [w for w in self._workers if not w.process.is_alive()]:
+            self._read(worker)  # 读完退出前发出的消息
+            self._workers.remove(worker)
+            worker.conn.close()
+            reason = worker.error or _exit_reason(worker.process.exitcode)
+            self._last_error = reason
+            trial = worker.trial
+            if trial is not None:
+                if self._stop_time is None and trial.index not in self._retried:
+                    self._retried.add(trial.index)
+                    self._queue.appendleft(trial)
+                    self._on_event(("retry", trial.index))
+                    self._log(f"组合 #{trial.index} 的训练进程意外退出（{reason}），稍后重试")
+                else:
+                    self._finish(trial.index, {"status": STATUS_FAILED, "error": f"训练进程意外退出：{reason}"})
+            if self._queue or any(w.trial for w in self._workers):
+                note = "" if self._hinted else "。" + CRASH_HINT
+                self._hinted = True
+                self._log(f"一个训练进程已退出（{reason}），同时训练的进程数减为 {len(self._workers)}{note}")
+
+    def _restart(self) -> bool:
+        """所有进程都已退出但还有组合没训练：重新启动 1 个进程。次数用完时剩余组合标记失败，返回 False。"""
+        if self._restarts < MAX_RESTARTS:
+            self._restarts += 1
+            self._log(f"所有训练进程都已退出，重新启动 1 个进程继续（第 {self._restarts} 次）")
+            self._spawn()
+            return True
+        error = f"训练进程反复退出：{self._last_error}" if self._last_error else "训练进程反复退出"
+        while self._queue:
+            self._finish(self._queue.popleft().index, {"status": STATUS_FAILED, "error": error})
+        self._log(f"{error}，剩余组合不再训练。{CRASH_HINT}")
+        return False
+
+    def _request_stop(self) -> None:
+        self._stop_time = time.monotonic()
+        self._stop_flag.value = 1
+        while self._queue:
+            self._finish(self._queue.popleft().index, {"status": STATUS_CANCELLED})
+        self._log("正在停止：正在训练的组合会保存当前结果，其余组合不再运行")
+
+    def _force_stop(self) -> None:
+        for worker in self._workers:
+            if worker.trial is not None:
+                worker.process.kill()
+                update = {"status": STATUS_STOPPED, "error": "停止超时，已强制结束，未保存结果"}
+                self._finish(worker.trial.index, update)
+                worker.trial = None
+        self._log(f"等待超过 {STOP_TIMEOUT:.0f} 秒，已强制结束仍在运行的训练进程")
+
+    def _finish(self, index: int, update: dict) -> None:
+        self._rows[index].update(update)
+        self._on_event(("done", index, dict(self._rows[index])))
+        _write_results(self._sweep_dir, self._rows, self._keys)
+
+    def _shutdown(self) -> None:
+        for worker in self._workers:
+            try:
+                worker.conn.send(None)
+            except OSError:
+                pass
+        deadline = time.monotonic() + 5
+        for worker in self._workers:
+            worker.process.join(max(0.0, deadline - time.monotonic()))
+            if worker.process.is_alive():
+                worker.process.kill()
+                worker.process.join()
+            worker.conn.close()
+        self._workers.clear()
+
+
+def _exit_reason(code: int | None) -> str:
+    if code is None:
+        return "进程无响应"
+    if code < 0:
+        return f"被系统结束（信号 {-code}）"
+    if code > 255:  # Windows 的异常代码，如 0xC0000005（访问冲突）
+        return f"退出码 0x{code & 0xFFFFFFFF:08X}"
+    return f"退出码 {code}"
 
 
 def rank_results(results: pd.DataFrame, metric: str) -> pd.DataFrame:
@@ -317,32 +496,25 @@ def is_sweep_dir(path: str | Path) -> bool:
     return (Path(path) / SWEEP_FILE).is_file()
 
 
-# ---------------------------------------------------------------------------- 子进程
-_DATA: PreparedData | None = None
-_EVENTS = None
-_STOP = None
-
-
-def _init_worker(data_file: str, events, stop, threads: int) -> None:
-    global _DATA, _EVENTS, _STOP
-    # 终端里按 Ctrl+C 时子进程也会收到，交给主进程通过 stop 统一处理（保存已训练的结果）
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    torch.set_num_threads(threads)
-    with open(data_file, "rb") as fh:
-        _DATA = pickle.load(fh)
-    _EVENTS, _STOP = events, stop
-
-
-def _run_trial(index: int, cfg_dict: dict, run_dir: str) -> dict:
-    if _STOP.is_set():
+# ---------------------------------------------------------------------------- 子进程中运行
+def run_trial(
+    index: int,
+    cfg_dict: dict,
+    run_dir: str,
+    data: PreparedData,
+    send: Callable[[tuple], None],
+    should_stop: Callable[[], bool],
+) -> dict:
+    """训练一个组合并保存结果，返回结果行。send 用于回传 ("start", 序号) 和 ("epoch", 序号, 记录)。"""
+    if should_stop():
         return {"status": STATUS_CANCELLED}
     cfg = ExperimentConfig.from_dict(cfg_dict)
-    _EVENTS.put(("start", index))
+    send(("start", index))
     started = time.perf_counter()
-    result = fit(cfg, _DATA, lambda record: _EVENTS.put(("epoch", index, record)), _STOP.is_set)
+    result = fit(cfg, data, lambda record: send(("epoch", index, record)), should_stop)
     path = Path(run_dir)
     path.mkdir(parents=True, exist_ok=True)
-    save_run(path, cfg, _DATA, result)
+    save_run(path, cfg, data, result)
     return {**_summary(result), "seconds": time.perf_counter() - started}
 
 
@@ -408,15 +580,6 @@ def _describe(known: dict[str, SweepAxis], keys: list[str], combo: tuple) -> str
 
 def _unique(values: list) -> list:
     return [v for i, v in enumerate(values) if v not in values[:i]]
-
-
-def _drain(events, on_event: Callable[[tuple], None]) -> None:
-    while True:
-        try:
-            event = events.get_nowait()
-        except queue_module.Empty:
-            return
-        on_event(event)
 
 
 def _write_results(sweep_dir: Path, rows: dict[int, dict], keys: list[str]) -> None:
