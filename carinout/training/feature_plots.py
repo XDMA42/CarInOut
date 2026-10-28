@@ -1,4 +1,8 @@
-"""数据集特征分析：各锚点特征的分布（车内 / 车外对比）与相关性，输出 PNG 和 CSV。
+"""数据集特征分析：各特征区分车内 / 车外的能力（区分度）、各锚点特征的分布与相关性，输出 PNG 和 CSV。
+
+区分度用 AUC 衡量：随机取一个车内样本和一个车外样本，按该特征能把两者分对的概率；0.5 = 没有区分度，1 = 完全分开。
+- 单列（某特征在某锚点上）：直接按特征值计算，与方向无关（车内偏大、偏小都算），并给出最佳阈值和平衡准确率。
+- 一个特征的全部锚点合起来：逻辑回归，按点位分组交叉验证，衡量对没见过的位置的区分能力（线性模型，是下限）。
 
 总表的特征列名为 “<特征>_<锚点名>”（见 merger.build_dataset），如 dis_sm_FL、dis_main_sm_FL、rssi_init_IR。
 锚点名取自 errcode_<锚点名> 列（每个锚点的原始 CSV 都有 errcode 列），据此把列名拆成 (特征, 锚点)，
@@ -19,17 +23,44 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.colors import LinearSegmentedColormap, to_rgb
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.ticker import PercentFormatter
 
-from ..merger import COMBINED_FILENAME, ERRCODE_COLUMN, LABEL_COLUMN, LABEL_INSIDE, LABEL_OUTSIDE
+from ..merger import (
+    COMBINED_FILENAME,
+    ERRCODE_COLUMN,
+    LABEL_COLUMN,
+    LABEL_INSIDE,
+    LABEL_OUTSIDE,
+    POINT_COLUMN,
+    SCENE_COLUMN,
+)
 from .data import CLASS_NAMES, feature_candidates, load_table, parse_labels, to_numeric
-from .plots import GRID, INK, INK_2, LINE_WIDTH, MUTED, SERIES, SURFACE, _placeholder, _style, new_figure
+from .metrics import roc_auc
+from .plots import (
+    GRID,
+    INK,
+    INK_2,
+    LINE_WIDTH,
+    MUTED,
+    SEQUENTIAL,
+    SERIES,
+    SURFACE,
+    _placeholder,
+    _style,
+    new_figure,
+)
 
 METHODS = {"pearson": "Pearson", "spearman": "Spearman"}
 MIN_PAIRS = 10  # 两列同时有值的行数少于此数时不计算相关系数
+CV_FOLDS = 5
+CV_MAX_TRAIN_ROWS = 20000  # 交叉验证每折最多用这么多行训练（随机抽样），行数很多时也能很快算完
+L2_LAMBDA = 1e-3  # 逻辑回归的 L2 系数（特征已标准化），防止可完全分开时权重发散
+UP, DOWN = "↑", "↓"  # 车内偏大 / 车内偏小
+INSIDE_HIGHER, INSIDE_LOWER = "车内偏大", "车内偏小"
+ALL_FEATURES = "全部所选特征"
 HIST_BINS = 40
 GRID_COLS = 5  # 按锚点分图时每行最多几张
 SCATTER_MAX_POINTS = 2000  # 散点图每个锚点、每个类别最多画的点数（随机抽样），避免点太密
@@ -37,6 +68,8 @@ SCATTER_MAX_PAIRS = 15  # 特征两两组合超过这么多对时不画散点图
 ANNOTATE_MAX = 30  # 相关矩阵超过这么多列时不在格子里写数值
 STATS_FILENAME = "stats.csv"
 CORR_FILENAME = "correlation.csv"
+DISC_FILENAME = "discrimination.csv"
+DISC_FEATURE_FILENAME = "discrimination_by_feature.csv"
 
 CLASS_COLORS = {LABEL_INSIDE: SERIES[0], LABEL_OUTSIDE: SERIES[1]}
 CLASS_KEYS = {LABEL_INSIDE: "inside", LABEL_OUTSIDE: "outside"}  # stats.csv 的列名
@@ -60,13 +93,17 @@ class FeatureTable:
     anchors: list[str]  # 锚点名，按列顺序（即车模上的顺序）
     columns: dict[tuple[str, str], str]  # (特征, 锚点) → 列名，按特征分组；某锚点没有该特征时不在字典中
     label_column: str = LABEL_COLUMN
+    points: pd.Series | None = None  # 每行所属点位（场景 + 点位），交叉验证按它分组；数据中没有这两列时为 None
     notes: list[str] = field(default_factory=list)
 
     def column(self, feature: str, anchor: str) -> str | None:
         return self.columns.get((feature, anchor))
 
+    def feature_columns(self, feature: str) -> list[str]:
+        return [col for (f, _), col in self.columns.items() if f == feature]
+
     def has_classes(self) -> bool:
-        """车内、车外都有数据（才能按类别对比、计算与标签的相关系数）。"""
+        """车内、车外都有数据（才能计算区分度、与标签的相关系数）。"""
         return self.labels is not None and self.labels.nunique() == 2
 
     def groups(self) -> list[tuple[str, str, np.ndarray]]:
@@ -149,6 +186,9 @@ def load_features(
     if unmatched:
         notes.append(f"以下数值列不是 “特征_锚点名” 格式，未分析：{_shorten(unmatched)}")
     values = pd.DataFrame({col: to_numeric(table[col]) for col in columns.values()}, index=table.index)
+    points = None
+    if {SCENE_COLUMN, POINT_COLUMN} <= set(table.columns):
+        points = table[SCENE_COLUMN].astype(str) + "\x1f" + table[POINT_COLUMN].astype(str)
     labels = None
     if label_column in table.columns:
         labels = parse_labels(table, label_column)
@@ -157,6 +197,7 @@ def load_features(
             notes.append(f"{int(unlabeled.sum())} 行没有标签，已忽略")
         values, labels = values[~unlabeled], labels[~unlabeled].astype(np.int64)
         labels = labels.reset_index(drop=True)
+        points = None if points is None else points[~unlabeled]
         if labels.nunique() < 2:
             notes.append(f"数据中只有{CLASS_NAMES[int(labels.iat[0])]}的样本" if len(labels) else "")
     else:
@@ -169,7 +210,7 @@ def load_features(
             notes.append(f"特征 {f} 在以下锚点没有数据列：{'、'.join(lacking)}")
     return FeatureTable(
         name, values.reset_index(drop=True), labels, features, anchors, columns, label_column,
-        [n for n in notes if n],
+        None if points is None else points.reset_index(drop=True), [n for n in notes if n],
     )
 
 
@@ -186,11 +227,94 @@ def correlation(ft: FeatureTable, method: str = "pearson") -> pd.DataFrame:
         return frame.corr(method=method, min_periods=MIN_PAIRS)
 
 
-def label_correlation(ft: FeatureTable, corr: pd.DataFrame) -> pd.DataFrame | None:
-    """与标签的相关系数，行 = 特征，列 = 锚点；没有车内 / 车外两类数据时为 None。"""
+def discrimination(ft: FeatureTable) -> pd.DataFrame | None:
+    """每个 (特征, 锚点) 列单独区分车内外的能力，按区分度从高到低排列；没有车内、车外两类数据时为 None。
+
+    auc：随机取一个车内样本和一个车外样本，车内样本该值更大的概率（相等算一半）。
+    separation = max(auc, 1 − auc)：区分度，与方向无关；0.5 = 没有区分度，1 = 完全分开。
+    rule / balanced_accuracy：只用这一列、按最佳阈值判断时的规则和平衡准确率（= 0.5 + KS / 2）。
+    只用该列有值的行；各类别的缺失比例单独列出（缺失本身也可能有区分度）。
+    """
     if not ft.has_classes():
         return None
-    return _grid(ft, lambda col: corr.at[col, ft.label_column])
+    inside = (ft.labels == LABEL_INSIDE).to_numpy()
+    rows = []
+    for (feature, anchor), col in ft.columns.items():
+        values = ft.values[col].to_numpy(dtype=float)
+        valid = np.isfinite(values)
+        v1, v0 = values[valid & inside], values[valid & ~inside]
+        row = {"feature": feature, "anchor": anchor, "column": col, "n_inside": len(v1), "n_outside": len(v0),
+               "missing_inside": 1 - len(v1) / inside.sum(), "missing_outside": 1 - len(v0) / (~inside).sum(),
+               "auc": np.nan, "separation": np.nan, "direction": "", "threshold": np.nan, "rule": "",
+               "balanced_accuracy": np.nan}
+        if len(v1) and len(v0):
+            auc = roc_auc(np.r_[np.ones(len(v1)), np.zeros(len(v0))], np.r_[v1, v0])
+            higher = auc >= 0.5
+            threshold, youden = _best_threshold(v1, v0, higher)
+            row.update(auc=auc, separation=max(auc, 1 - auc), direction=INSIDE_HIGHER if higher else INSIDE_LOWER,
+                       threshold=threshold, rule=f"{'≥' if higher else '≤'} {threshold:g} 判车内",
+                       balanced_accuracy=0.5 + youden / 2)
+        rows.append(row)
+    table = pd.DataFrame(rows).sort_values("separation", ascending=False, na_position="last", kind="stable")
+    return table.reset_index(drop=True)
+
+
+def feature_discrimination(ft: FeatureTable, disc: pd.DataFrame, seed: int = 0) -> pd.DataFrame | None:
+    """每个特征把全部锚点合起来的区分度；有多个特征时最后加一行全部所选特征合起来。
+
+    cv_auc：逻辑回归、按点位分组交叉验证的 AUC，衡量对没见过的位置的区分能力；best_single：单列区分度的最大值。
+    cv_auc 明显高于 best_single 说明多个锚点合起来比只看最好的一个锚点更有用。
+    """
+    if not ft.has_classes():
+        return None
+    y = ft.labels.to_numpy(dtype=np.int64)
+    points = None if ft.points is None else ft.points.to_numpy()
+    best = disc.groupby("feature")["separation"].max()
+    sets = [(f, ft.feature_columns(f), best.get(f, np.nan)) for f in ft.features]
+    if len(ft.features) > 1:
+        sets.append((ALL_FEATURES, list(ft.columns.values()), disc["separation"].max()))
+    rows = []
+    for name, cols, best_single in sets:
+        auc, folds = cross_val_auc(ft.values[cols].to_numpy(dtype=float), y, points, seed=seed)
+        rows.append({"feature": name, "columns": len(cols), "cv_auc": auc, "folds": folds,
+                     "best_single": best_single})
+    return pd.DataFrame(rows)
+
+
+def cross_val_auc(
+    x: np.ndarray, y: np.ndarray, points: np.ndarray | None = None, folds: int = CV_FOLDS, seed: int = 0
+) -> tuple[float, int]:
+    """逻辑回归 k 折交叉验证的 AUC（各折测试部分的预测合在一起计算），返回 (AUC, 实际折数)。
+
+    points 不为 None 时同一点位的行整体分在同一折（按标签分层），否则按行随机分折。
+    缺失值用训练部分的均值填充，再按训练部分标准化。某类的点位少于 2 个、无法分折时 AUC 为 NaN。
+    """
+    rng = np.random.default_rng(seed)
+    groups = np.arange(len(y)) if points is None else np.unique(points, return_inverse=True)[1]
+    group_label = np.zeros(groups.max() + 1 if len(groups) else 0, dtype=np.int64)
+    group_label[groups] = y
+    k = min(folds, *(int((group_label == c).sum()) for c in (0, 1)))
+    if k < 2:
+        return np.nan, 0
+    fold_of = np.empty(len(group_label), dtype=np.int64)
+    for c in (0, 1):
+        members = rng.permutation(np.flatnonzero(group_label == c))
+        fold_of[members] = np.arange(len(members)) % k
+    row_fold = fold_of[groups]
+    scores = np.empty(len(y))
+    for fold in range(k):
+        train, test = np.flatnonzero(row_fold != fold), np.flatnonzero(row_fold == fold)
+        if len(train) > CV_MAX_TRAIN_ROWS:
+            train = rng.choice(train, CV_MAX_TRAIN_ROWS, replace=False)
+        x_train = x[train]
+        means = np.nanmean(np.where(np.isnan(x_train).all(axis=0), 0.0, x_train), axis=0)
+        x_train = np.where(np.isnan(x_train), means, x_train)
+        std = x_train.std(axis=0)
+        std = np.where(std > 0, std, 1.0)
+        weights = _fit_logistic((x_train - means) / std, y[train])
+        x_test = np.where(np.isnan(x[test]), means, x[test])
+        scores[test] = _with_bias((x_test - means) / std) @ weights
+    return roc_auc(y, scores), k
 
 
 def describe(ft: FeatureTable, corr: pd.DataFrame) -> pd.DataFrame:
@@ -213,9 +337,13 @@ def describe(ft: FeatureTable, corr: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------- 图表
-def draw_distribution(fig: Figure, ft: FeatureTable, feature: str) -> None:
-    """一个特征在各锚点上的分布：上方为各锚点的箱线图，下方每个锚点一张直方图（各类别分别归一化）。"""
+def draw_distribution(fig: Figure, ft: FeatureTable, feature: str, disc: pd.DataFrame | None = None) -> None:
+    """一个特征在各锚点上的分布：上方为各锚点的箱线图，下方每个锚点一张直方图（各类别分别归一化）。
+
+    disc（见 discrimination）不为 None 时，锚点名旁标出该列的区分度 AUC。
+    """
     fig.clear()
+    auc = _auc_texts(disc)
     groups = ft.groups()
     anchors = ft.anchors
     nrows, ncols = _grid_shape(len(anchors))
@@ -228,7 +356,7 @@ def draw_distribution(fig: Figure, ft: FeatureTable, feature: str) -> None:
     low, high = _display_range(pooled)
 
     ax = top.subplots()
-    _style(ax, "箱体 25%–75%，横线为中位数，须线 5%–95%")
+    _style(ax, "箱体 25%–75%，横线为中位数，须线 5%–95%" + ("；锚点名下方为区分度 AUC（↑ 车内偏大，↓ 车内偏小）" if auc else ""))
     width = 0.8 / len(groups)
     for k, (_, color, mask) in enumerate(groups):
         data, positions = [], []
@@ -247,7 +375,7 @@ def draw_distribution(fig: Figure, ft: FeatureTable, feature: str) -> None:
                 whiskerprops={"color": color, "linewidth": 1.2},
                 capprops={"color": color, "linewidth": 1.2},
             )
-    ax.set_xticks(range(len(anchors)), anchors)
+    ax.set_xticks(range(len(anchors)), [f"{a}\n{auc.get(ft.column(feature, a), '')}".strip() for a in anchors])
     ax.tick_params(axis="x", labelsize=9, labelcolor=INK_2)
     ax.set_xlim(-0.6, len(anchors) - 0.4)
     if low < high:
@@ -262,8 +390,8 @@ def draw_distribution(fig: Figure, ft: FeatureTable, feature: str) -> None:
     edges = _bin_edges(pooled, low, high)
     axes = bottom.subplots(nrows, ncols, squeeze=False, sharex=True, sharey=True)
     for ax, anchor in zip(axes.flat, anchors):
-        _style(ax, anchor)
         col = ft.column(feature, anchor)
+        _style(ax, f"{anchor}    AUC {auc[col]}" if col in auc else anchor)
         if col is None or not ft.values[col].notna().any():
             _placeholder(ax, "没有该列" if col is None else "全部为空")
             continue
@@ -323,14 +451,43 @@ def draw_pair_correlation(fig: Figure, ft: FeatureTable, corr: pd.DataFrame, met
     _colorbar(fig, mesh, ax, method)
 
 
-def draw_label_correlation(fig: Figure, ft: FeatureTable, by_anchor: pd.DataFrame, method: str) -> None:
-    """各特征与标签（车内 = 1）的相关系数：行 = 特征，列 = 锚点。绝对值越大，单独用它区分车内外越有效。"""
+def draw_discrimination(fig: Figure, ft: FeatureTable, disc: pd.DataFrame, by_feature: pd.DataFrame | None) -> None:
+    """区分度总览：左为各特征在各锚点上的单列 AUC（行 = 特征，列 = 锚点），右为每个特征全部锚点合起来的交叉验证 AUC。"""
     fig.clear()
-    ax = fig.subplots()
-    mesh = _heatmap(ax, by_anchor.to_numpy(dtype=float), ft.anchors, ft.features, annotate=True)
-    ax.set_title(_title(ft, f"与标签的相关系数（{METHODS[method]}，正值 = 车内时偏大）"), loc="left", fontsize=11,
-                 color=INK, pad=8)
-    _colorbar(fig, mesh, ax, method)
+    texts = _auc_texts(disc)
+    separation = disc.set_index("column")["separation"]
+    matrix = _grid(ft, lambda col: separation.get(col, np.nan)).to_numpy()
+    labels = [[texts.get(ft.column(f, a), "—") for a in ft.anchors] for f in ft.features]
+    cv = None if by_feature is None else by_feature.set_index("feature")["cv_auc"]
+    if cv is not None and cv.notna().any():
+        heat_ax, bar_ax = fig.subplots(1, 2, sharey=True, gridspec_kw={"width_ratios": [max(len(ft.anchors), 2), 3]})
+    else:
+        heat_ax, bar_ax = fig.subplots(), None
+    fig.suptitle(_title(ft, "各特征区分车内 / 车外的能力（AUC：0.5 = 没有区分度，1 = 完全分开）"), x=0.01, ha="left",
+                 fontsize=12, color=INK)
+    cmap = LinearSegmentedColormap.from_list("sequential", SEQUENTIAL).with_extremes(bad=SURFACE)
+    _heatmap(heat_ax, matrix, ft.anchors, ft.features, cmap=cmap, vmin=0.5, vmax=1.0, texts=labels)
+    heat_ax.set_title(f"单列 AUC（{UP} {INSIDE_HIGHER}，{DOWN} {INSIDE_LOWER}）", loc="left", fontsize=10, color=INK, pad=8)
+    if bar_ax is None:
+        return
+    values = cv.reindex(ft.features).to_numpy(dtype=float)
+    y = np.arange(len(ft.features)) + 0.5
+    _style(bar_ax, "全部锚点合起来")
+    bar_ax.grid(False)
+    bar_ax.grid(axis="x", color=GRID, linewidth=0.8)
+    bar_ax.barh(y, np.nan_to_num(values - 0.5), left=0.5, height=0.5, color=SERIES[0])
+    for yi, v in zip(y, values):
+        bar_ax.text(v + 0.01 if np.isfinite(v) else 0.51, yi, f"{v:.2f}" if np.isfinite(v) else "—", va="center",
+                    fontsize=8, color=INK_2)
+    low = min(0.5, np.nanmin(values) - 0.03)
+    bar_ax.set_xlim(low, 1.07)
+    bar_ax.set_xticks([t for t in (0.5, 0.6, 0.7, 0.8, 0.9, 1.0) if t >= low])
+    folds = int(by_feature["folds"].max())
+    xlabel = f"逻辑回归，{'按点位' if ft.points is not None else '按行'} {folds} 折交叉验证 AUC"
+    if np.isfinite(cv.get(ALL_FEATURES, np.nan)):
+        bar_ax.axvline(cv[ALL_FEATURES], color=INK_2, lw=1, ls=(0, (3, 3)))
+        xlabel += f"\n虚线：{ALL_FEATURES}合起来 {cv[ALL_FEATURES]:.2f}"
+    bar_ax.set_xlabel(xlabel, color=MUTED, fontsize=8)
 
 
 def draw_scatter(fig: Figure, ft: FeatureTable, fx: str, fy: str, corr: pd.DataFrame, method: str) -> None:
@@ -375,10 +532,23 @@ def draw_scatter(fig: Figure, ft: FeatureTable, fx: str, fy: str, corr: pd.DataF
                    frameon=False, fontsize=8, labelcolor=INK_2)
 
 
+@dataclass
+class Analysis:
+    method: str
+    corr: pd.DataFrame  # 见 correlation
+    disc: pd.DataFrame | None  # 单列区分度，见 discrimination；没有两类数据时为 None
+    by_feature: pd.DataFrame | None  # 每个特征全部锚点合起来的区分度，见 feature_discrimination
+
+
+def analyze(ft: FeatureTable, method: str = "pearson") -> Analysis:
+    disc = discrimination(ft)
+    return Analysis(method, correlation(ft, method), disc, None if disc is None else feature_discrimination(ft, disc))
+
+
 def save_all(
     ft: FeatureTable,
+    analysis: Analysis,
     out_dir: Path,
-    method: str = "pearson",
     scatter: bool = True,
     dpi: int = 120,
     log: Callable[[str], None] | None = None,
@@ -387,7 +557,7 @@ def save_all(
     log = log or (lambda _msg: None)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    corr = correlation(ft, method)
+    corr, disc, method = analysis.corr, analysis.disc, analysis.method
     written: list[Path] = []
 
     def save(filename: str, size: tuple[float, float], draw: Callable[[Figure], None]) -> None:
@@ -398,22 +568,21 @@ def save_all(
         written.append(path)
         log(f"  {filename}")
 
+    heat_width = max(6.0, 0.75 * len(ft.anchors) + 3.5)
+    if disc is not None:
+        save("discrimination.png", (heat_width + 3.0, 2.0 + 0.5 * len(ft.features)),
+             lambda fig: draw_discrimination(fig, ft, disc, analysis.by_feature))
     nrows, ncols = _grid_shape(len(ft.anchors))
     for feature in ft.features:
-        save(f"dist_{_safe(feature)}.png", (max(8.0, 2.8 * ncols), 3.6 + 2.3 * nrows),
-             lambda fig, f=feature: draw_distribution(fig, ft, f))
+        save(f"dist_{_safe(feature)}.png", (max(8.0, 2.8 * ncols), 3.8 + 2.3 * nrows),
+             lambda fig, f=feature: draw_distribution(fig, ft, f, disc))
     n = len(ft.columns)
     side = min(24.0, max(6.0, 0.42 * n + 3.0))
     save("corr_matrix.png", (side + 1.2, side), lambda fig: draw_correlation_matrix(fig, ft, corr, method))
-    heat_width = max(6.0, 0.75 * len(ft.anchors) + 3.5)
     if len(ft.features) > 1:
         n_pairs = len(ft.features) * (len(ft.features) - 1) // 2
         save("corr_pairs.png", (heat_width + 1.5, 1.6 + 0.45 * n_pairs),
              lambda fig: draw_pair_correlation(fig, ft, corr, method))
-    by_label = label_correlation(ft, corr)
-    if by_label is not None:
-        save("corr_label.png", (heat_width, 1.6 + 0.45 * len(ft.features)),
-             lambda fig: draw_label_correlation(fig, ft, by_label, method))
     if scatter and len(ft.features) > 1:
         # 只画在同一锚点上都有数据列的特征对
         pairs = [(fx, fy) for fx, fy in combinations(ft.features, 2)
@@ -423,7 +592,11 @@ def save_all(
         for fx, fy in pairs if len(pairs) <= SCATTER_MAX_PAIRS else []:
             save(f"scatter_{_safe(fx)}__{_safe(fy)}.png", (max(8.0, 2.8 * ncols), 0.8 + 2.6 * nrows),
                  lambda fig, a=fx, b=fy: draw_scatter(fig, ft, a, b, corr, method))
-    for filename, frame, index in ((STATS_FILENAME, describe(ft, corr), False), (CORR_FILENAME, corr, True)):
+    tables = [(DISC_FILENAME, disc, False), (DISC_FEATURE_FILENAME, analysis.by_feature, False),
+              (STATS_FILENAME, describe(ft, corr), False), (CORR_FILENAME, corr, True)]
+    for filename, frame, index in tables:
+        if frame is None:
+            continue
         frame.to_csv(out_dir / filename, index=index, encoding="utf-8-sig", float_format="%.6g")
         written.append(out_dir / filename)
         log(f"  {filename}")
@@ -434,14 +607,15 @@ def save_all(
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python plot_features.py",
-        description="画出数据集中各锚点特征的分布（车内 / 车外对比）与相关性，保存为 PNG，并输出统计表。",
+        description="分析数据集中各特征区分车内 / 车外的能力（区分度 AUC），画出各锚点特征的分布与相关性，"
+        "保存为 PNG，并输出统计表。",
     )
     p.add_argument("dataset", help=f"数据集：含 {COMBINED_FILENAME} 的文件夹（数据集构建工具的导出文件夹）或 csv 文件")
     p.add_argument("--features", help="要分析的特征，逗号分隔，不带锚点后缀，如 dis_sm,dis_main_sm,rssi_init；默认全部")
     p.add_argument("--anchors", help="只分析这些锚点，逗号分隔，如 FL,F,FR；默认全部")
     p.add_argument("--method", choices=list(METHODS), default="pearson",
-                   help="相关系数：pearson（线性）/ spearman（按秩，适合 RSSI 与距离这类单调非线性关系，"
-                        "也不易受 65535 这类无效值影响），默认 pearson")
+                   help="相关图中的相关系数：pearson（线性）/ spearman（按秩，适合 RSSI 与距离这类单调非线性关系，"
+                        "也不易受 65535 这类无效值影响），默认 pearson。区分度 AUC 不受此项影响")
     p.add_argument("-o", "--output", help="输出文件夹，默认为数据集文件夹下的 feature_plots")
     p.add_argument("--label-column", default=LABEL_COLUMN, help=f"标签列名，默认 {LABEL_COLUMN}")
     p.add_argument("--no-scatter", action="store_true", help="不画特征两两之间的散点图")
@@ -481,15 +655,44 @@ def main(argv: list[str]) -> int:
     for note in ft.notes:
         print(note)
 
+    if ft.has_classes() and ft.points is None:
+        print("数据中没有 scene / point 列，交叉验证按行划分：同一点位相邻时刻的样本会同时出现在训练和测试中，结果偏乐观")
+
+    analysis = analyze(ft, args.method)
     out_dir = Path(args.output) if args.output else default_output(csv_path)
     print(f"\n输出到 {out_dir}：")
-    save_all(ft, out_dir, args.method, scatter=not args.no_scatter, dpi=args.dpi, log=print)
-
-    by_label = label_correlation(ft, correlation(ft, args.method))
-    if by_label is not None:
-        print(f"\n与标签的相关系数（{METHODS[args.method]}，正值 = 车内时偏大，绝对值越大越能区分车内外）：")
-        print(by_label.to_string(float_format=lambda v: f"{v:.2f}", na_rep="—"))
+    save_all(ft, analysis, out_dir, scatter=not args.no_scatter, dpi=args.dpi, log=print)
+    _print_discrimination(ft, analysis)
     return 0
+
+
+def _print_discrimination(ft: FeatureTable, analysis: Analysis, top: int = 10) -> None:
+    disc, by_feature = analysis.disc, analysis.by_feature
+    if disc is None:
+        print("\n没有车内、车外两类数据，无法计算区分度")
+        return
+    texts = _auc_texts(disc)
+    table = pd.DataFrame(
+        [[texts.get(ft.column(f, a), "—") for a in ft.anchors] for f in ft.features],
+        index=pd.Index(ft.features, name="特征"),
+        columns=pd.Index(ft.anchors, name="锚点"),
+    )
+    cv = by_feature.set_index("feature")["cv_auc"]
+    combined = "全部锚点"
+    table[combined] = [f"{v:.2f}" if np.isfinite(v) else "—" for v in cv.reindex(ft.features)]
+    folds = int(by_feature["folds"].max())
+    print(f"\n区分度 AUC（0.5 = 没有区分度，1 = 完全分开；{UP} {INSIDE_HIGHER}，{DOWN} {INSIDE_LOWER}）：")
+    with pd.option_context("display.unicode.east_asian_width", True, "display.width", 200):
+        print(table.to_string())
+    how = f"逻辑回归，{'按点位' if ft.points is not None else '按行'} {folds} 折交叉验证" if folds else "点位太少，无法交叉验证"
+    print(f"“{combined}”：该特征所有锚点合起来的区分度（{how}）")
+    if ALL_FEATURES in cv.index and np.isfinite(cv[ALL_FEATURES]):
+        print(f"{ALL_FEATURES}合起来：{cv[ALL_FEATURES]:.2f}")
+    shown = disc[disc["separation"].notna()].head(top)
+    print(f"\n单列区分度最高的 {len(shown)} 列（只用这一列、按阈值判断）：")
+    width = max(map(len, shown["column"]), default=0)
+    for row in shown.itertuples():
+        print(f"  {row.column:<{width}}  AUC {row.separation:.2f}  {row.rule}，平衡准确率 {row.balanced_accuracy:.0%}")
 
 
 # ---------------------------------------------------------------------------- 内部
@@ -579,15 +782,18 @@ def _bin_edges(values: np.ndarray, low: float, high: float) -> np.ndarray:
     return np.linspace(low, high, HIST_BINS + 1)
 
 
-def _heatmap(ax, matrix: np.ndarray, xlabels: list[str], ylabels: list[str], annotate: bool):
-    cmap = LinearSegmentedColormap.from_list("diverging", DIVERGING).with_extremes(bad=SURFACE)
+def _heatmap(ax, matrix: np.ndarray, xlabels: list[str], ylabels: list[str], annotate: bool = True, cmap=None,
+             vmin: float = -1.0, vmax: float = 1.0, texts: list[list[str]] | None = None):
+    """色块图，默认为 −1 ~ 1 的发散色阶（相关系数）。texts 为各格的文字，默认写两位小数。"""
+    cmap = cmap or LinearSegmentedColormap.from_list("diverging", DIVERGING).with_extremes(bad=SURFACE)
     rows, cols = matrix.shape
     gap = 2 if max(rows, cols) <= 40 else 0.5
     _style(ax, "")
     ax.grid(False)
     for spine in ax.spines.values():
         spine.set_visible(False)
-    mesh = ax.pcolormesh(np.ma.masked_invalid(matrix), cmap=cmap, vmin=-1, vmax=1, edgecolors=SURFACE, linewidth=gap)
+    mesh = ax.pcolormesh(np.ma.masked_invalid(matrix), cmap=cmap, vmin=vmin, vmax=vmax, edgecolors=SURFACE,
+                         linewidth=gap)
     size = 8 if max(rows, cols) <= 40 else 6
     rotate = max(map(len, xlabels), default=0) > 4
     ax.set_xticks(np.arange(cols) + 0.5, xlabels, rotation=90 if rotate else 0, fontsize=size)
@@ -599,10 +805,64 @@ def _heatmap(ax, matrix: np.ndarray, xlabels: list[str], ylabels: list[str], ann
         for i in range(rows):
             for j in range(cols):
                 v = matrix[i, j]
-                ax.text(j + 0.5, i + 0.5, f"{v:.2f}" if np.isfinite(v) else "—", ha="center", va="center",
-                        fontsize=7 if cols > 15 else 8,
-                        color=MUTED if not np.isfinite(v) else "#ffffff" if abs(v) >= 0.6 else INK)
+                finite = np.isfinite(v)
+                text = texts[i][j] if texts is not None else f"{v:.2f}" if finite else "—"
+                color = MUTED if not finite else "#ffffff" if _is_dark(cmap((v - vmin) / (vmax - vmin))) else INK
+                ax.text(j + 0.5, i + 0.5, text, ha="center", va="center", fontsize=7 if cols > 15 else 8, color=color)
     return mesh
+
+
+def _is_dark(color) -> bool:
+    """背景色的相对亮度低于 0.179 时，白字比黑字对比度高。"""
+    rgb = np.array(to_rgb(color))
+    linear = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
+    return float(linear @ [0.2126, 0.7152, 0.0722]) < 0.179
+
+
+def _auc_texts(disc: pd.DataFrame | None) -> dict[str, str]:
+    """列名 → “0.93↑” 这样的区分度文字（箭头为方向）。"""
+    if disc is None:
+        return {}
+    return {
+        row.column: f"{row.separation:.2f}{UP if row.direction == INSIDE_HIGHER else DOWN}"
+        for row in disc.itertuples()
+        if np.isfinite(row.separation)
+    }
+
+
+def _best_threshold(v1: np.ndarray, v0: np.ndarray, higher: bool) -> tuple[float, float]:
+    """只用一列判断车内的最佳阈值（使 真正率 − 假正率 最大），返回 (阈值, 真正率 − 假正率)。
+
+    higher 为 True 时规则为 “≥ 阈值判车内”，否则为 “≤ 阈值判车内”；v1 / v0 为车内 / 车外的值。
+    """
+    sign = 1.0 if higher else -1.0
+    s1, s0 = np.sort(sign * v1), np.sort(sign * v0)
+    candidates = np.unique(np.concatenate([s1, s0]))
+    tpr = 1 - np.searchsorted(s1, candidates, side="left") / len(s1)
+    fpr = 1 - np.searchsorted(s0, candidates, side="left") / len(s0)
+    best = int(np.argmax(tpr - fpr))
+    return float(sign * candidates[best]), float(tpr[best] - fpr[best])
+
+
+def _with_bias(x: np.ndarray) -> np.ndarray:
+    return np.column_stack([x, np.ones(len(x))])
+
+
+def _fit_logistic(x: np.ndarray, y: np.ndarray, iterations: int = 30) -> np.ndarray:
+    """带 L2 正则（不含偏置）的逻辑回归，牛顿法求解，返回 [各特征权重..., 偏置]。"""
+    xb = _with_bias(x)
+    ridge = np.full(xb.shape[1], L2_LAMBDA)
+    ridge[-1] = 1e-8
+    weights = np.zeros(xb.shape[1])
+    for _ in range(iterations):
+        p = 1 / (1 + np.exp(-np.clip(xb @ weights, -30, 30)))
+        grad = xb.T @ (p - y) / len(y) + ridge * weights
+        hess = (xb.T * (p * (1 - p))) @ xb / len(y) + np.diag(ridge)
+        step = np.linalg.lstsq(hess, grad, rcond=None)[0]
+        weights -= step
+        if np.abs(step).max() < 1e-6:
+            break
+    return weights
 
 
 def _colorbar(fig: Figure, mesh, ax, method: str) -> None:
