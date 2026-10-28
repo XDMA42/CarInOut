@@ -20,7 +20,8 @@
       "hidden_sizes": [
         64,
         32
-      ]
+      ],
+      "dropout": 0.0
     }
   },
   "train": {

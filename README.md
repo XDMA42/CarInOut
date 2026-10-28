@@ -143,6 +143,8 @@ python train.py --dataset D:/data/merged/1023采集 --dataset D:/data/merged/102
 
 - 默认模型 **MLP**：`输入 → Linear → ReLU → Linear → ReLU → Linear → 2 个 logits`，即 3 层全连接，
   隐藏层节点数默认 `64, 32`。填几个数字就是几层隐藏层（如 `128, 64, 32` 为 4 层全连接）。
+- **Dropout**（可选）：比例大于 0 时，每个隐藏层的 ReLU 后加一层 Dropout，训练时按该比例随机把输出置 0，
+  用于减轻过拟合；评估、推理时不生效。默认 0（不使用），可设 0 ~ 0.9，常用 0.1 ~ 0.5。
 - **损失 = 交叉熵 + λ × Σ‖W‖²**：L2 项只对权重计算，不含偏置；两部分分别记录，在损失曲线中单独显示。
 - 输出经 softmax 得到车内概率，≥ 0.5 判为车内；正类 = 车内。
 - 训练结束后自动换回**验证集交叉熵最低**那个 epoch 的模型参数（没有验证集时按训练集总损失），评估和保存都用它。
@@ -156,6 +158,7 @@ python train.py --dataset D:/data/merged/1023采集 --dataset D:/data/merged/102
 | 训练数据 | `data.datasets`（文件夹列表） | `--dataset 文件夹`（可重复） | 无 |
 | 输入特征 | `data.features`（空 = 全部非常数数值列） | `--features rssi_FL,rssi_F` | 全部 |
 | 隐藏层节点数 | `model.params.hidden_sizes` | `--hidden 64,32` | `[64, 32]` |
+| Dropout 比例 | `model.params.dropout` | `--dropout 0.2` | 0 |
 | batch size | `train.batch_size` | `--batch-size` | 64 |
 | learning rate | `train.learning_rate` | `--lr` | 0.001 |
 | epoch 数 | `train.epochs` | `--epochs` | 100 |
@@ -202,6 +205,7 @@ python train.py --dataset D:/data/merged/1023采集 --dataset D:/data/merged/102
 | L2 系数 λ | `1e-5, 1e-4, 1e-3` |
 | epoch 数 | `50, 100` |
 | 第 N 层隐藏层节点数（每层一项，层数与左侧“隐藏层节点数”一致） | 第 1 层 `32, 64, 128`，第 2 层 `16, 32` |
+| Dropout 比例 | `0, 0.2, 0.5` |
 
 留空的参数使用左侧的设置；数据集、特征、数据划分等其余设置也都取自左侧，所有组合共用同一份数据划分。
 上例共 3 × 2 × 3 × 2 = 36 组。
@@ -222,10 +226,11 @@ python train.py --dataset D:/data/merged/1023采集 --dataset D:/data/merged/102
 
 ```bash
 python train.py --config configs/mlp.json --workers 8 \
-    --sweep bs=32,64,128 --sweep lr=1e-3,3e-4 --sweep hidden1=32,64,128 --sweep hidden2=16,32
+    --sweep bs=32,64,128 --sweep lr=1e-3,3e-4 --sweep hidden1=32,64,128 --sweep hidden2=16,32 \
+    --sweep dropout=0,0.2
 ```
 
-`--sweep` 可用的参数名：`bs`（batch size）、`lr`、`l2`、`epochs`、`hidden1` / `hidden2` …（第 N 层隐藏层节点数）；
+`--sweep` 可用的参数名：`bs`（batch size）、`lr`、`l2`、`epochs`、`hidden1` / `hidden2` …（第 N 层隐藏层节点数）、`dropout`；
 `--rank-by` 选择排序指标（`val_accuracy` / `val_f1` / `val_auc` / `val_ce`）。按 Ctrl+C 停止，已训练的结果会保存。
 
 结果保存在 `runs/时间_sweep/`：`results.csv`（每组一行：参数取值、状态、最佳 epoch、训练 / 验证 / 测试集指标、耗时）、

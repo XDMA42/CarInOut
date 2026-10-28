@@ -60,12 +60,12 @@ RANK_METRICS = {
 LOWER_IS_BETTER = {"val_ce"}
 METRIC_KEYS = ("ce", "accuracy", "precision", "recall", "f1", "auc")
 
-# 可遍历的训练参数：配置项 → (界面名称, 组合名称中的缩写)
+# 可遍历的训练参数：配置项 → (界面名称, 组合名称中的缩写, 取值示例；为空时按当前值生成)
 TRAIN_AXES = {
-    "batch_size": ("batch size", "bs"),
-    "learning_rate": ("learning rate", "lr"),
-    "l2_lambda": ("L2 系数 λ", "l2"),
-    "epochs": ("epoch 数", "ep"),
+    "batch_size": ("batch size", "bs", ""),
+    "learning_rate": ("learning rate", "lr", "0.001, 0.0003"),
+    "l2_lambda": ("L2 系数 λ", "l2", "0, 0.0001, 0.001"),
+    "epochs": ("epoch 数", "ep", ""),
 }
 # 命令行 --sweep 的别名
 ALIASES = {
@@ -84,6 +84,7 @@ class SweepAxis:
     short: str
     base: Any  # 基础配置中的取值
     parse_one: Callable[[str], Any]
+    example: str  # 界面中的取值示例
 
     def parse(self, text: str) -> list:
         """“32, 64, 128” → [32, 64, 128]；逗号、分号、空格分隔，重复值只保留一个。"""
@@ -112,9 +113,9 @@ def available_axes(base: ExperimentConfig) -> list[SweepAxis]:
     """可遍历的参数：训练参数 + 模型的数值 / 选项参数；整数列表参数（如隐藏层节点数）按每个位置分别遍历。"""
     axes = []
     defaults = OptimConfig()
-    for name, (label, short) in TRAIN_AXES.items():
-        kind = type(getattr(defaults, name))
-        axes.append(SweepAxis(f"train.{name}", label, short, getattr(base.train, name), _number_parser(kind)))
+    for name, (label, short, example) in TRAIN_AXES.items():
+        kind, value = type(getattr(defaults, name)), getattr(base.train, name)
+        axes.append(SweepAxis(f"train.{name}", label, short, value, _number_parser(kind), example or _example(value)))
     spec = get_spec(base.model.name)
     params = spec.resolve_params(base.model.params)
     for p in spec.params:
@@ -123,9 +124,12 @@ def available_axes(base: ExperimentConfig) -> list[SweepAxis]:
             for i, value in enumerate(params[p.name]):
                 parse = _number_parser(int)
                 axes.append(SweepAxis(f"model.{p.name}[{i}]", f"第 {i + 1} 层{p.label}", f"{short}{i + 1}-", value,
-                                      lambda text, p=p, parse=parse: p.parse([parse(text)])[0]))
+                                      lambda text, p=p, parse=parse: p.parse([parse(text)])[0],
+                                      p.example or _example(value)))
         elif p.kind in (KIND_INT, KIND_FLOAT, KIND_CHOICE):
-            axes.append(SweepAxis(f"model.{p.name}", p.label, f"{short}-", params[p.name], p.parse))
+            value = params[p.name]
+            axes.append(SweepAxis(f"model.{p.name}", p.label, f"{short}-", value, p.parse,
+                                  p.example or _example(value)))
     return axes
 
 
@@ -383,6 +387,15 @@ def _apply(cfg: ExperimentConfig, key: str, value: Any) -> None:
         cfg.model.params[match.group(1)] = values
     else:
         cfg.model.params[name] = value
+
+
+def _example(value: Any) -> str:
+    """按当前值生成取值示例：整数取一半、本身、两倍；小数取十分之一、本身、十倍。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, int):
+        return f"{max(1, value // 2)}, {value}, {value * 2}"
+    return f"{value / 10:g}, {value:g}, {value * 10:g}" if value else "0"
 
 
 def _fmt(value: Any) -> str:

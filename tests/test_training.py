@@ -51,17 +51,38 @@ def test_mlp_has_three_linear_layers_with_relu():
     assert [m.out_features for m in custom.net if isinstance(m, nn.Linear)] == [128, 16, 2]
 
 
+def test_mlp_dropout():
+    model = models.build_model("mlp", 6, 2, {"hidden_sizes": [32, 16], "dropout": 0.5})
+    types = [type(m) for m in model.net]
+    assert types == [nn.Linear, nn.ReLU, nn.Dropout, nn.Linear, nn.ReLU, nn.Dropout, nn.Linear]
+    assert all(m.p == 0.5 for m in model.net if isinstance(m, nn.Dropout))
+    x = torch.randn(64, 6)
+    model.train()
+    assert not torch.equal(model(x), model(x))  # 训练时随机置 0
+    model.eval()
+    assert torch.equal(model(x), model(x))  # 评估时不生效
+    # dropout 为 0 时结构与旧版本相同，旧的参数文件仍能加载
+    old_keys = set(models.build_model("mlp", 6, 2, {"hidden_sizes": [32, 16]}).state_dict())
+    assert old_keys == {"net.0.weight", "net.0.bias", "net.2.weight", "net.2.bias", "net.4.weight", "net.4.bias"}
+
+
 @pytest.mark.parametrize("value", ["", "a,2", "0,8", [8.5], 16])
 def test_invalid_mlp_params(value):
     with pytest.raises(ValueError):
         models.get_spec("mlp").resolve_params({"hidden_sizes": value})
 
 
+@pytest.mark.parametrize("value", [-0.1, 0.95, 1, "abc"])
+def test_invalid_dropout(value):
+    with pytest.raises(ValueError, match="Dropout"):
+        models.get_spec("mlp").resolve_params({"dropout": value})
+
+
 def test_unknown_model_and_param():
     with pytest.raises(ValueError, match="未知的模型"):
         models.get_spec("svm")
     with pytest.raises(ValueError, match="没有参数"):
-        models.get_spec("mlp").resolve_params({"dropout": 0.1})
+        models.get_spec("mlp").resolve_params({"batch_norm": True})
 
 
 def test_registered_model_trains_without_other_changes(dataset: Path, tmp_path: Path):
@@ -153,6 +174,7 @@ def test_without_validation_set(dataset: Path, tmp_path: Path):
 # ---------------------------------------------------------------------------- 结果保存
 def test_save_and_load_run(dataset: Path, tmp_path: Path):
     cfg = config(dataset, tmp_path, epochs=5)
+    cfg.model.params["dropout"] = 0.2
     cfg.data.missing = "mean"
     cfg.run_name = "h16 8"
     data = prepare_data(cfg.data, cfg.train.seed)
@@ -166,7 +188,7 @@ def test_save_and_load_run(dataset: Path, tmp_path: Path):
 
     run = load_run(run_dir)
     assert run.config.data.features == data.features  # 保存的是实际使用的特征
-    assert run.config.model.params == {"hidden_sizes": [16, 8]}
+    assert run.config.model.params == {"hidden_sizes": [16, 8], "dropout": 0.2}
     assert len(run.history) == 5 and run.metrics["best_epoch"] == result.best_epoch
     assert run.metrics["splits"]["test"]["n"] == len(data.test)
     assert len(run.predictions) == len(data.train) + len(data.val) + len(data.test)
@@ -256,10 +278,10 @@ def test_cli(dataset: Path, tmp_path: Path, capsys):
     out = tmp_path / "cli_runs"
     args = ["--dataset", str(dataset), "--hidden", "8,4", "--batch-size", "16", "--lr", "0.01",
             "--epochs", "3", "--l2", "0.001", "--features", "rssi_FL,rssi_IF", "--output-dir", str(out)]
-    assert cli_main(args) == 0
+    assert cli_main(args + ["--dropout", "0.3"]) == 0
     (run_dir,) = out.iterdir()
     saved = load_run(run_dir).config
-    assert saved.model.params == {"hidden_sizes": [8, 4]}
+    assert saved.model.params == {"hidden_sizes": [8, 4], "dropout": 0.3}
     assert saved.train.batch_size == 16 and saved.train.learning_rate == 0.01 and saved.train.l2_lambda == 0.001
     assert saved.data.features == ["rssi_FL", "rssi_IF"]
 

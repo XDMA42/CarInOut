@@ -46,11 +46,12 @@ def axis(base: ExperimentConfig, key: str):
 def test_axes_and_aliases(base: ExperimentConfig):
     keys = [a.key for a in available_axes(base)]
     assert keys == ["train.batch_size", "train.learning_rate", "train.l2_lambda", "train.epochs",
-                    "model.hidden_sizes[0]", "model.hidden_sizes[1]"]
+                    "model.hidden_sizes[0]", "model.hidden_sizes[1]", "model.dropout"]
     assert axis(base, "model.hidden_sizes[1]").base == 8
     for name, key in [("bs", "train.batch_size"), ("batch-size", "train.batch_size"), ("lr", "train.learning_rate"),
                       ("l2", "train.l2_lambda"), ("epochs", "train.epochs"), ("hidden1", "model.hidden_sizes[0]"),
-                      ("h2", "model.hidden_sizes[1]"), ("model.hidden_sizes[0]", "model.hidden_sizes[0]")]:
+                      ("h2", "model.hidden_sizes[1]"), ("model.hidden_sizes[0]", "model.hidden_sizes[0]"),
+                      ("dropout", "model.dropout")]:
         assert resolve_axis_key(base, name) == key
     with pytest.raises(ValueError, match="不能遍历"):
         resolve_axis_key(base, "hidden3")  # 基础配置只有两层隐藏层
@@ -60,8 +61,9 @@ def test_parse_values(base: ExperimentConfig):
     assert axis(base, "train.batch_size").parse("32, 64，128 64") == [32, 64, 128]
     assert axis(base, "train.learning_rate").parse("1e-3; 3e-4") == [0.001, 0.0003]
     assert axis(base, "model.hidden_sizes[0]").parse("") == []
+    assert axis(base, "model.dropout").parse("0, 0.2，0.5") == [0.0, 0.2, 0.5]
     for key, text, message in [("train.batch_size", "32.5", "不是整数"), ("train.learning_rate", "abc", "不是数字"),
-                               ("model.hidden_sizes[0]", "0", "不能小于 1")]:
+                               ("model.hidden_sizes[0]", "0", "不能小于 1"), ("model.dropout", "1", "不能大于 0.9")]:
         with pytest.raises(ValueError, match=message):
             axis(base, key).parse(text)
 
@@ -75,6 +77,9 @@ def test_expand_grid(base: ExperimentConfig):
     assert last.train.batch_size == 32 and last.model.params["hidden_sizes"] == [12, 8]
     assert last.train.learning_rate == base.train.learning_rate
     assert base.model.params == {"hidden_sizes": [16, 8]}  # 基础配置不被修改
+    dropout = expand_grid(base, {"model.dropout": [0.0, 0.3]})
+    assert [t.name for t in dropout] == ["001_do-0", "002_do-0.3"]
+    assert dropout[1].config.model.params == {"hidden_sizes": [16, 8], "dropout": 0.3}
     (only,) = expand_grid(base, {})
     assert only.name == "001_base" and only.overrides == {}
     with pytest.raises(ValueError, match="batch size=0"):
@@ -109,9 +114,9 @@ def test_run_sweep_in_parallel(base: ExperimentConfig):
     row = results.set_index("trial").loc[4]
     assert (row["train.batch_size"], row["model.hidden_sizes[1]"]) == (32, 8)
     run = load_run(path / row["name"])
-    assert run.config.train.batch_size == 32 and run.config.model.params == {"hidden_sizes": [16, 8]}
+    assert run.config.train.batch_size == 32 and run.config.model.params == {"hidden_sizes": [16, 8], "dropout": 0.0}
     assert (path / row["name"] / "loss.png").is_file()
-    assert record.trial_config(row).model.params == {"hidden_sizes": [16, 8]}
+    assert record.trial_config(row).model.params == {"hidden_sizes": [16, 8], "dropout": 0.0}
 
     # 与单独训练同一组参数的结果一致（各进程中的训练可复现）
     from carinout.training.data import prepare_data
@@ -144,7 +149,8 @@ def test_cli_sweep(base: ExperimentConfig, tmp_path: Path, capsys):
     val.mkdir()
     make_dataset(val / "_dataset.csv", n_inside=3, n_outside=3, rows_per_point=10, seed=9)
     args = ["--dataset", base.data.datasets[0], "--epochs", "2", "--hidden", "8,4", "--output-dir", str(out),
-            "--sweep", "lr=0.01,0.001", "--sweep", "hidden2=2,4", "--workers", "2", "--rank-by", "val_auc",
+            "--sweep", "lr=0.01,0.001", "--sweep", "hidden2=2,4", "--sweep", "dropout=0,0.2", "--workers", "2",
+            "--rank-by", "val_auc",
             "--val-dataset", str(val)]
     assert cli_main(args) == 0
     (path,) = out.iterdir()
@@ -153,8 +159,8 @@ def test_cli_sweep(base: ExperimentConfig, tmp_path: Path, capsys):
     results = record.results
     assert results["val_auc"].notna().all()
     assert load_run(path / results["name"].iloc[0]).predictions.query("split == 'val'")["source"].eq("val_day").all()
-    assert sorted(zip(results["train.learning_rate"], results["model.hidden_sizes[1]"])) == [
-        (0.001, 2), (0.001, 4), (0.01, 2), (0.01, 4)]
+    combos = sorted(zip(results["train.learning_rate"], results["model.hidden_sizes[1]"], results["model.dropout"]))
+    assert combos == [(lr, h, d) for lr in (0.001, 0.01) for h in (2, 4) for d in (0.0, 0.2)]
     assert "按验证集 AUC排序" in capsys.readouterr().out
     assert cli_main(["--dataset", base.data.datasets[0], "--sweep", "hidden5=8"]) == 1
     assert cli_main(["--dataset", base.data.datasets[0], "--sweep", "bs"]) == 1

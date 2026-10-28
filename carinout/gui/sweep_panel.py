@@ -260,7 +260,7 @@ class SweepPanel(QWidget):
         self._axes = axes
         for axis in axes:
             base_text = axis.base if not isinstance(axis.base, float) else f"{axis.base:g}"
-            self._edits[axis.key].setPlaceholderText(f"左侧当前为 {base_text}，如填 “{_example(axis)}”")
+            self._edits[axis.key].setPlaceholderText(f"左侧当前为 {base_text}，如填 “{axis.example}”")
         self._update_count()
 
     def _save_texts(self) -> None:
@@ -588,13 +588,3 @@ class SweepPanel(QWidget):
         if index >= 0:
             self.rank_combo.setCurrentIndex(index)
 
-
-def _example(axis: SweepAxis) -> str:
-    base = axis.base
-    if axis.key == "train.learning_rate":
-        return "0.001, 0.0003"
-    if isinstance(base, bool) or not isinstance(base, (int, float)):
-        return str(base)
-    if isinstance(base, int):
-        return f"{max(1, base // 2)}, {base}, {base * 2}"
-    return f"{base / 10:g}, {base:g}, {base * 10:g}"

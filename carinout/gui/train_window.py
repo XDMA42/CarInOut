@@ -68,7 +68,7 @@ from ..training.data import (
 )
 from ..training.metrics import METRIC_NAMES
 from ..training.models import available_models, get_spec
-from ..training.models.base import KIND_BOOL, KIND_CHOICE, KIND_INT, ModelSpec, ParamSpec
+from ..training.models.base import KIND_BOOL, KIND_CHOICE, KIND_FLOAT, KIND_INT, ModelSpec, ParamSpec
 from ..training.plots import draw_losses, draw_metrics
 from ..training.runs import (
     RunRecord,
@@ -653,7 +653,14 @@ class TrainWindow(QMainWindow):
                 widget = QCheckBox()
                 widget.setChecked(value)
                 widget.toggled.connect(self._update_structure)
-            else:  # 浮点数、整数列表用文本框
+            elif param.kind == KIND_FLOAT and param.minimum is not None and param.maximum is not None:
+                widget = QDoubleSpinBox()  # 有上下限的小数（如 Dropout 比例）
+                widget.setRange(param.minimum, param.maximum)
+                widget.setDecimals(3)
+                widget.setSingleStep(0.05)
+                widget.setValue(value)
+                widget.valueChanged.connect(self._update_structure)
+            else:  # 其他浮点数、整数列表用文本框
                 widget = QLineEdit(param.format(value))
                 widget.textChanged.connect(self._update_structure)
             widget.setToolTip(param.help)
@@ -665,7 +672,7 @@ class TrainWindow(QMainWindow):
         """读取模型参数并校验，非法时抛出 ValueError。"""
         values = {}
         for name, (param, widget) in self._param_widgets.items():
-            if isinstance(widget, QSpinBox):
+            if isinstance(widget, (QSpinBox, QDoubleSpinBox)):
                 raw = widget.value()
             elif isinstance(widget, QComboBox):
                 raw = widget.currentText()

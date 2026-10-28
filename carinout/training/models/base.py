@@ -31,6 +31,7 @@ class ParamSpec:
     maximum: float | None = None
     choices: tuple[str, ...] = ()
     short: str = ""  # 参数遍历时组合名称中的缩写，如 hidden_sizes → h
+    example: str = ""  # 参数遍历时的取值示例，如 “0, 0.2, 0.5”；为空时按当前值生成
 
     def parse(self, value: Any) -> Any:
         """把配置文件或界面中的值转换为正确类型并检查范围，非法时抛出 ValueError。"""

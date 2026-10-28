@@ -45,6 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--list-features", action="store_true", help="列出数据集中可用的特征列后退出")
     p.add_argument("--model", help=f"模型：{models}")
     p.add_argument("--hidden", help="MLP 隐藏层节点数，如 64,32（等同 --param hidden_sizes=64,32）")
+    p.add_argument("--dropout", type=float, help="MLP 的 Dropout 比例，0 ~ 0.9（等同 --param dropout=0.2）")
     p.add_argument("--param", action="append", default=[], metavar="名称=值", help="模型参数，可重复")
     p.add_argument("--batch-size", type=int)
     p.add_argument("--lr", type=float, help="learning rate")
@@ -67,8 +68,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="参数=值1,值2",
-        help="可重复。参数：bs（batch size）、lr、l2、epochs、hidden1 / hidden2 …（第 N 层隐藏层节点数），"
-        "如 --sweep bs=32,64 --sweep hidden1=32,64,128",
+        help="可重复。参数：bs（batch size）、lr、l2、epochs、hidden1 / hidden2 …（第 N 层隐藏层节点数）、"
+        "dropout，如 --sweep bs=32,64 --sweep hidden1=32,64,128 --sweep dropout=0,0.2",
     )
     g.add_argument("--workers", type=int, default=os.cpu_count() or 1, help="并行训练的进程数（默认 CPU 核数）")
     g.add_argument("--rank-by", choices=list(RANK_METRICS), default="val_accuracy", help="挑选最佳组合的验证集指标")
@@ -108,6 +109,8 @@ def apply_args(cfg: ExperimentConfig, args: argparse.Namespace) -> ExperimentCon
     params = dict(cfg.model.params)
     if args.hidden:
         params["hidden_sizes"] = args.hidden
+    if args.dropout is not None:
+        params["dropout"] = args.dropout
     for item in args.param:
         key, sep, value = item.partition("=")
         if not sep:
