@@ -54,8 +54,10 @@ from ..training.config import (
 )
 from ..training.data import (
     CLASS_NAMES,
+    IMBALANCE_RATIO,
     NUM_CLASSES,
     FeatureInfo,
+    class_ratio,
     dataset_name,
     default_features,
     feature_candidates,
@@ -99,6 +101,7 @@ HISTORY_HEADERS = {
     "val_ce": "验证交叉熵",
     "train_accuracy": "训练准确率",
     "val_accuracy": "验证准确率",
+    "val_balanced_accuracy": "验证平衡准确率",
     "val_precision": "验证精确率",
     "val_recall": "验证召回率",
     "val_f1": "验证 F1",
@@ -155,6 +158,7 @@ class TrainWindow(QMainWindow):
         self._param_widgets: dict[str, tuple[ParamSpec, QWidget]] = {}
         self._history: list[dict] = []
         self._run: RunRecord | None = None
+        self._threshold = 0.5  # 当前显示的训练所用的判定阈值
         self._thread: QThread | None = None
         self._worker: TrainWorker | None = None
         self._redraw_timer = QTimer(self)
@@ -382,6 +386,16 @@ class TrainWindow(QMainWindow):
         self.class_weight_combo.addItem("不加权", "none")
         self.class_weight_combo.addItem("按样本数平衡", "balanced")
         self.class_weight_combo.setToolTip("车内、车外样本数相差较大时，可按样本数的倒数给交叉熵加权")
+        self.threshold_spin = QDoubleSpinBox()
+        self.threshold_spin.setRange(0.01, 0.99)
+        self.threshold_spin.setSingleStep(0.05)
+        self.threshold_spin.setDecimals(2)
+        self.threshold_spin.setPrefix("车内概率 ≥ ")
+        self.threshold_spin.setSuffix(" 判为车内")
+        self.threshold_spin.setToolTip(
+            "只影响准确率、混淆矩阵等按类别计算的指标和预测结果，不影响训练和 AUC；\n"
+            "调高可减少车外误判为车内，调低可减少车内漏判，会保存到模型中"
+        )
         self.early_spin = QSpinBox()
         self.early_spin.setRange(0, 1_000_000)
         self.early_spin.setSpecialValueText("不提前停止")
@@ -405,6 +419,7 @@ class TrainWindow(QMainWindow):
         form.addRow("L2 系数 λ", self.l2_edit)
         form.addRow("优化器", self.optimizer_combo)
         form.addRow("类别权重", self.class_weight_combo)
+        form.addRow("判定阈值", self.threshold_spin)
         form.addRow("提前停止", self.early_spin)
         form.addRow("设备", self.device_combo)
         return box
@@ -523,6 +538,10 @@ class TrainWindow(QMainWindow):
             f"{len(files)} 个文件夹，{rows}" if len(files) > 1 else rows,
             "，".join(f"{CLASS_NAMES[c]} {int(counts.get(c, 0)):,}" for c in CLASS_NAMES),
         ]
+        outside, inside, ratio = class_ratio(labels)
+        if IMBALANCE_RATIO <= ratio < math.inf:
+            more, less = ("车外", "车内") if outside > inside else ("车内", "车外")
+            parts.append(f"{more}是{less}的 {ratio:.1f} 倍，建议类别权重选“按样本数平衡”")
         if all({SCENE_COLUMN, POINT_COLUMN} <= set(t.columns) for t in tables):
             meta = pd.concat([t[[SCENE_COLUMN, POINT_COLUMN]] for t in tables], ignore_index=True)
             points = meta.groupby([SCENE_COLUMN, POINT_COLUMN]).ngroups  # 与数据划分一致：同名点位算同一位置
@@ -706,6 +725,7 @@ class TrainWindow(QMainWindow):
                 l2_lambda=number(self.l2_edit, "L2 系数"),
                 optimizer=self.optimizer_combo.currentData(),
                 class_weight=self.class_weight_combo.currentData(),
+                threshold=round(self.threshold_spin.value(), 4),
                 early_stopping=self.early_spin.value(),
                 seed=self.seed_spin.value(),
                 device=self.device_combo.currentData(),
@@ -735,6 +755,7 @@ class TrainWindow(QMainWindow):
         self.l2_edit.setText(f"{t.l2_lambda:g}")
         self._set_combo(self.optimizer_combo, t.optimizer)
         self._set_combo(self.class_weight_combo, t.class_weight)
+        self.threshold_spin.setValue(t.threshold)
         self.early_spin.setValue(t.early_stopping)
         self._set_combo(self.device_combo, t.device)
         self.output_edit.setText(cfg.output_dir)
@@ -874,6 +895,7 @@ class TrainWindow(QMainWindow):
 
         self._history = []
         self._run = None
+        self._threshold = cfg.train.threshold
         self.history_table.setRowCount(0)
         self._redraw_curves()
         self._show_evaluation(None)
@@ -904,7 +926,10 @@ class TrainWindow(QMainWindow):
         self._append_history_row(record)
         text = f"epoch {record['epoch']}：训练集总损失 {record['train_loss']:.4f}"
         if not math.isnan(record["val_ce"]):
-            text += f"，验证集交叉熵 {record['val_ce']:.4f}，准确率 {record['val_accuracy']:.2%}"
+            text += (
+                f"，验证集交叉熵 {record['val_ce']:.4f}，准确率 {record['val_accuracy']:.2%}"
+                f"，平衡准确率 {record['val_balanced_accuracy']:.2%}"
+            )
         self.statusBar().showMessage(text)
         if not self._redraw_timer.isActive():
             self._redraw_timer.start()
@@ -920,7 +945,7 @@ class TrainWindow(QMainWindow):
     def _redraw_curves(self) -> None:
         best = self._run.metrics.get("best_epoch", 0) if self._run else self._live_best_epoch()
         self.loss_chart.update_history(self._history, best)
-        self.metric_chart.update_history(self._history, best)
+        self.metric_chart.update_history(self._history, best, threshold=self._threshold)
 
     def _cleanup_worker(self) -> None:
         if self._thread:
@@ -1007,6 +1032,7 @@ class TrainWindow(QMainWindow):
 
     def _show_run(self, run: RunRecord) -> None:
         self._run = run
+        self._threshold = run.metrics.get("threshold", run.config.train.threshold)
         self._history = run.history.to_dict("records")
         self._redraw_curves()
         self.history_table.setRowCount(0)
@@ -1047,7 +1073,8 @@ class TrainWindow(QMainWindow):
         used = f"使用第 {best} 个 epoch 的模型" if best else "没有完成任何 epoch，模型为初始参数"
         header = (
             f"{run.path}\n共训练 {m.get('epochs_run', len(run.history))} 个 epoch{state}，{used}，"
-            f"{m.get('num_parameters', 0):,} 个参数，{len(m.get('features', []))} 个输入特征"
+            f"{m.get('num_parameters', 0):,} 个参数，{len(m.get('features', []))} 个输入特征，"
+            f"判定阈值 {m.get('threshold', 0.5):g}"
         )
         self.eval_page.show_results(run.path, header, m, run.predictions)
         self.statusBar().showMessage(f"训练结果：{run.path}")

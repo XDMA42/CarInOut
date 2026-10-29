@@ -12,9 +12,9 @@ import torch
 from torch import Tensor, nn
 
 from .config import ExperimentConfig
-from .data import NUM_CLASSES, SPLITS, PreparedData
+from .data import CLASS_NAMES, NUM_CLASSES, SPLITS, PreparedData, imbalance_note
 from .losses import Objective, class_weights
-from .metrics import binary_metrics
+from .metrics import METRIC_NAMES, binary_metrics
 from .models import get_spec
 
 # history 中每个 epoch 记录的字段；val_* 在没有验证集时为 NaN
@@ -25,8 +25,9 @@ HISTORY_COLUMNS = (
     "l2",  # λ × Σ‖W‖²
     "val_loss",  # 验证集交叉熵 + epoch 结束时的 L2 项
     "val_ce",
-    "train_accuracy",
+    "train_accuracy",  # 训练时各 batch 的准确率（按判定阈值）
     "val_accuracy",
+    "val_balanced_accuracy",
     "val_precision",
     "val_recall",
     "val_f1",
@@ -72,8 +73,8 @@ def make_optimizer(name: str, params, lr: float) -> torch.optim.Optimizer:
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, objective: Objective, x: Tensor, y: Tensor) -> EvalResult:
-    """整个数据集上的交叉熵（与训练时同样的类别加权）和车内概率。"""
+def evaluate(model: nn.Module, objective: Objective, x: Tensor, y: Tensor, threshold: float = 0.5) -> EvalResult:
+    """整个数据集上的交叉熵（与训练时同样的类别加权）、车内概率，以及按判定阈值计算的指标。"""
     model.eval()
     ce_sum, weight_sum, probs = 0.0, 0.0, []
     for start in range(0, len(y), EVAL_BATCH):
@@ -86,7 +87,7 @@ def evaluate(model: nn.Module, objective: Objective, x: Tensor, y: Tensor) -> Ev
     prob = torch.cat(probs).numpy().astype(np.float64) if probs else np.zeros(0)
     labels = y.cpu().numpy()
     loss = ce_sum / weight_sum if weight_sum else math.nan
-    return EvalResult(loss, binary_metrics(labels, prob), prob)
+    return EvalResult(loss, binary_metrics(labels, prob, threshold), prob)
 
 
 def fit(
@@ -110,8 +111,13 @@ def fit(
     optimizer = make_optimizer(opt.optimizer, model.parameters(), opt.learning_rate)
     result = TrainResult(model, device=str(device), num_parameters=sum(p.numel() for p in model.parameters()))
     log(f"模型：{spec.summary(len(data.features), NUM_CLASSES, cfg.model.params)}；设备：{device}")
+    note = imbalance_note(data.train.y, opt.class_weight)
+    if note:
+        log(note)
     if weights is not None:
-        log("类别权重：" + "，".join(f"{w:.3f}" for w in weights.tolist()))
+        log("类别权重：" + "，".join(f"{CLASS_NAMES[c]} {w:.3f}" for c, w in enumerate(weights.tolist())))
+    if opt.threshold != 0.5:
+        log(f"判定阈值：车内概率 ≥ {opt.threshold:g} 判为车内")
 
     tensors = {
         name: (torch.from_numpy(data.split(name).x).to(device), torch.from_numpy(data.split(name).y).to(device))
@@ -142,7 +148,8 @@ def fit(
             optimizer.step()
             ce_sum += ce.detach() * len(idx)
             l2_sum += l2.detach() * len(idx)
-            correct += (logits.argmax(dim=1) == y_train[idx]).sum()
+            inside = torch.softmax(logits.detach(), dim=1)[:, 1] >= opt.threshold
+            correct += (inside.long() == y_train[idx]).sum()
         if result.stopped:  # 不完整的 epoch 不记录
             break
 
@@ -157,9 +164,9 @@ def fit(
             "train_accuracy": correct.item() / n,
         }
         if has_val:
-            val = evaluate(model, objective, x_val, y_val)
+            val = evaluate(model, objective, x_val, y_val, opt.threshold)
             record.update(val_loss=val.loss + l2_now, val_ce=val.loss)
-            record.update({f"val_{k}": val.metrics[k] for k in ("accuracy", "precision", "recall", "f1", "auc")})
+            record.update({f"val_{k}": val.metrics[k] for k in METRIC_NAMES})
         record["seconds"] = time.perf_counter() - started
         record = {key: record.get(key, math.nan) for key in HISTORY_COLUMNS}
         result.history.append(record)
@@ -183,6 +190,6 @@ def fit(
     for name in SPLITS:
         x, y = tensors[name]
         if len(y):
-            result.evals[name] = evaluate(model, objective, x, y)
+            result.evals[name] = evaluate(model, objective, x, y, opt.threshold)
     model.cpu()
     return result

@@ -89,13 +89,15 @@ def draw_losses(fig: Figure, history: pd.DataFrame | list[dict], best_epoch: int
     ]
 
 
-def draw_metrics(fig: Figure, history: pd.DataFrame | list[dict], best_epoch: int = 0) -> list[EpochPanel]:
-    """验证集上各评价指标随 epoch 的变化（阈值 0.5，正类 = 车内）。"""
+def draw_metrics(
+    fig: Figure, history: pd.DataFrame | list[dict], best_epoch: int = 0, threshold: float = 0.5
+) -> list[EpochPanel]:
+    """验证集上各评价指标随 epoch 的变化（正类 = 车内，按判定阈值计算）。"""
     history = pd.DataFrame(history)
     fig.clear()
     ax = fig.subplots()
     series = [(f"val_{key}", name, SERIES[i]) for i, (key, name) in enumerate(METRIC_NAMES.items())]
-    title = "验证集评价指标（正类 = 车内，阈值 0.5）"
+    title = f"验证集评价指标（正类 = 车内，阈值 {threshold:g}）"
     panel = _epoch_panel(ax, title, history, series, best_epoch, legend_loc="lower right", tag_at_top=False)
     if panel.series:
         low = min(np.nanmin(s.y) for s in panel.series)
@@ -103,19 +105,19 @@ def draw_metrics(fig: Figure, history: pd.DataFrame | list[dict], best_epoch: in
     return [panel]
 
 
-def draw_evaluation(fig: Figure, scores: dict[str, tuple[np.ndarray, np.ndarray]]) -> None:
-    """验证集、测试集的混淆矩阵与 ROC 曲线。scores：split → (真实标签, 车内概率)。"""
+def draw_evaluation(fig: Figure, scores: dict[str, tuple[np.ndarray, np.ndarray]], threshold: float = 0.5) -> None:
+    """验证集、测试集的混淆矩阵（按判定阈值）与 ROC 曲线。scores：split → (真实标签, 车内概率)。"""
     fig.clear()
     axes = fig.subplots(1, 3, gridspec_kw={"width_ratios": [1, 1, 1.15]})
     for ax, name in zip(axes[:2], ("val", "test")):
         if name in scores:
-            _confusion(ax, name, *scores[name])
+            _confusion(ax, name, *scores[name], threshold)
         else:
             _style(ax, f"{SPLIT_NAMES[name]}混淆矩阵")
             _placeholder(ax, f"没有{SPLIT_NAMES[name]}")
             ax.set_xticks([])
             ax.set_yticks([])
-    _roc(axes[2], scores)
+    _roc(axes[2], scores, threshold)
 
 
 def draw_sweep(
@@ -166,11 +168,11 @@ def draw_sweep(
                handlelength=1.2)
 
 
-def save_figures(run_dir: Path, history: pd.DataFrame, best_epoch: int, scores: dict) -> None:
+def save_figures(run_dir: Path, history: pd.DataFrame, best_epoch: int, scores: dict, threshold: float = 0.5) -> None:
     for filename, size, draw in (
         ("loss.png", (13, 3.8), lambda f: draw_losses(f, history, best_epoch)),
-        ("metrics.png", (8, 4.2), lambda f: draw_metrics(f, history, best_epoch)),
-        ("evaluation.png", (13, 4.2), lambda f: draw_evaluation(f, scores)),
+        ("metrics.png", (8, 4.2), lambda f: draw_metrics(f, history, best_epoch, threshold)),
+        ("evaluation.png", (13, 4.2), lambda f: draw_evaluation(f, scores, threshold)),
     ):
         fig = new_figure(*size, dpi=120)
         draw(fig)
@@ -227,12 +229,13 @@ def _epoch_panel(
     return panel
 
 
-def _confusion(ax, name: str, labels: np.ndarray, probs: np.ndarray) -> None:
-    m = binary_metrics(labels, probs)
+def _confusion(ax, name: str, labels: np.ndarray, probs: np.ndarray, threshold: float) -> None:
+    m = binary_metrics(labels, probs, threshold)
     cm = np.asarray(m["confusion"], dtype=float)
     share = cm / np.maximum(cm.sum(axis=1, keepdims=True), 1)  # 按真实类别（行）归一化
     cmap = LinearSegmentedColormap.from_list("seq", SEQUENTIAL)
-    _style(ax, f"{SPLIT_NAMES[name]}混淆矩阵 · 准确率 {m['accuracy']:.1%}")
+    note = f"（阈值 {threshold:g}）" if threshold != 0.5 else ""
+    _style(ax, f"{SPLIT_NAMES[name]}混淆矩阵 · 准确率 {m['accuracy']:.1%}{note}")
     ax.grid(False)
     for spine in ax.spines.values():
         spine.set_visible(False)
@@ -253,8 +256,8 @@ def _confusion(ax, name: str, labels: np.ndarray, probs: np.ndarray) -> None:
     ax.set_aspect("equal")
 
 
-def _roc(ax, scores: dict[str, tuple[np.ndarray, np.ndarray]]) -> None:
-    _style(ax, "ROC 曲线")
+def _roc(ax, scores: dict[str, tuple[np.ndarray, np.ndarray]], threshold: float) -> None:
+    _style(ax, f"ROC 曲线 · 圆点为判定阈值 {threshold:g} 的位置")
     ax.grid(axis="x", color=GRID, linewidth=0.8)
     ax.plot([0, 1], [0, 1], color=AXIS, lw=0.8)
     shown = [n for n in ("val", "test") if n in scores] or [n for n in ("train",) if n in scores]
@@ -264,9 +267,13 @@ def _roc(ax, scores: dict[str, tuple[np.ndarray, np.ndarray]]) -> None:
         fpr, tpr = roc_curve(labels, probs)
         if np.isnan(fpr).any() or np.isnan(tpr).any():
             continue
-        auc = binary_metrics(labels, probs)["auc"]
-        ax.plot(fpr, tpr, color=SPLIT_COLORS[name], lw=LINE_WIDTH, label=f"{SPLIT_NAMES[name]}  AUC {auc:.3f}",
+        m = binary_metrics(labels, probs, threshold)
+        ax.plot(fpr, tpr, color=SPLIT_COLORS[name], lw=LINE_WIDTH, label=f"{SPLIT_NAMES[name]}  AUC {m['auc']:.3f}",
                 solid_joinstyle="round")
+        (tn, fp), (fn, tp) = m["confusion"]
+        # 当前阈值对应的工作点：调高阈值沿曲线往左下走（车外误判为车内更少，车内漏判更多）
+        ax.scatter([fp / max(tn + fp, 1)], [tp / max(tp + fn, 1)], s=60, color=SPLIT_COLORS[name],
+                   edgecolors=SURFACE, linewidths=2, zorder=4)
         drawn = True
     if drawn:
         ax.legend(loc="lower right", frameon=False, fontsize=8, labelcolor=INK_2, handlelength=1.4)

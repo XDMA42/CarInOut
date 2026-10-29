@@ -58,8 +58,10 @@ def evaluate_model(
     val_datasets: list[str],
     test_datasets: list[str],
     log: Callable[[str], None] | None = None,
+    threshold: float | None = None,
 ) -> EvaluationRecord:
-    """用 model_dir 中的模型评估独立验证集、测试集（各自可有多个文件夹），保存并返回结果。"""
+    """用 model_dir 中的模型评估独立验证集、测试集（各自可有多个文件夹），保存并返回结果。
+    threshold 为判定阈值，默认使用模型训练时设定的阈值。"""
     log = log or (lambda _msg: None)
     model_dir = Path(model_dir)
     if model_dir.is_file():  # 也可以直接给 model.pt
@@ -74,16 +76,22 @@ def evaluate_model(
         raise ValueError(f"{'、'.join(sorted(dataset_name(p) for p in both))} 同时出现在验证集和测试集中")
 
     predictor = Predictor.load(model_dir)
+    threshold = predictor.threshold if threshold is None else threshold
+    if not 0 < threshold < 1:
+        raise ValueError("判定阈值应在 0 ~ 1 之间（不含 0 和 1）")
     label_column, train_files = _training_info(model_dir)
     notes: list[str] = []
     used_in_training = [f for paths in files.values() for f in paths if f.resolve() in train_files]
     if used_in_training:
         names = "、".join(dataset_name(f) for f in used_in_training)
         notes.append(f"注意：{names} 是该模型的训练数据，指标会偏乐观")
-    log(f"评估模型：{model_dir}（{predictor.describe()}，{len(predictor.features)} 个输入特征）")
+    n_features = len(predictor.features)
+    log(f"评估模型：{model_dir}（{predictor.describe()}，{n_features} 个输入特征，判定阈值 {threshold:g}）")
 
     frames = [
-        _predict_file(predictor, path, split, label_column, notes) for split, paths in files.items() for path in paths
+        _predict_file(predictor, path, split, label_column, threshold, notes)
+        for split, paths in files.items()
+        for path in paths
     ]
     predictions = pd.concat(frames, ignore_index=True)
     if predictions.empty:
@@ -93,14 +101,15 @@ def evaluate_model(
         part = predictions[predictions[SPLIT_COLUMN] == split]
         if len(part):
             labels, probs = part[TRUE_COLUMN].to_numpy(), part[PROB_COLUMN].to_numpy()
-            splits[split] = {"loss": _cross_entropy(labels, probs), **binary_metrics(labels, probs)}
+            splits[split] = {"loss": _cross_entropy(labels, probs), **binary_metrics(labels, probs, threshold)}
     metrics = {
         "model": str(model_dir),
         "model_description": predictor.describe(),
         "features": list(predictor.features),
+        "threshold": threshold,
         "datasets": {split: [str(f.resolve()) for f in paths] for split, paths in files.items() if paths},
         "splits": splits,
-        "sources": per_source_metrics(predictions),
+        "sources": per_source_metrics(predictions, threshold),
         "scenes": per_scene_accuracy(predictions).to_dict("records"),
         "notes": notes,
     }
@@ -111,7 +120,10 @@ def evaluate_model(
     for note in notes:
         log(note)
     for split, values in splits.items():
-        log(f"  {SPLIT_NAMES[split]}：{values['n']:,} 行，准确率 {values['accuracy']:.2%}，AUC {values['auc']:.4f}")
+        log(
+            f"  {SPLIT_NAMES[split]}：{values['n']:,} 行，准确率 {values['accuracy']:.2%}，"
+            f"平衡准确率 {values['balanced_accuracy']:.2%}，AUC {values['auc']:.4f}"
+        )
     log(f"评估结果已保存到 {out}")
     return EvaluationRecord(out, model_dir, metrics, predictions)
 
@@ -120,7 +132,7 @@ def save_evaluation_figure(record: EvaluationRecord) -> None:
     from . import plots  # matplotlib 只在画图时需要
 
     fig = plots.new_figure(13, 4.2, dpi=120)
-    plots.draw_evaluation(fig, split_scores(record.predictions))
+    plots.draw_evaluation(fig, split_scores(record.predictions), record.metrics.get("threshold", 0.5))
     fig.savefig(record.path / FIGURE_FILE, facecolor=plots.SURFACE)
 
 
@@ -152,7 +164,9 @@ def _training_info(model_dir: Path) -> tuple[str, set[Path]]:
     return cfg.data.label_column, train_files
 
 
-def _predict_file(predictor: Predictor, path: Path, split: str, label_column: str, notes: list[str]) -> pd.DataFrame:
+def _predict_file(
+    predictor: Predictor, path: Path, split: str, label_column: str, threshold: float, notes: list[str]
+) -> pd.DataFrame:
     name = dataset_name(path)
     df = load_table(path)
     try:
@@ -169,7 +183,7 @@ def _predict_file(predictor: Predictor, path: Path, split: str, label_column: st
     frame.insert(0, SPLIT_COLUMN, split)
     frame[TRUE_COLUMN] = labels[keep].astype(np.int64).to_numpy()
     frame[PROB_COLUMN] = prob[keep]
-    frame[PRED_COLUMN] = (prob[keep] >= 0.5).astype(np.int64)
+    frame[PRED_COLUMN] = (prob[keep] >= threshold).astype(np.int64)
     return frame.reset_index(drop=True)
 
 

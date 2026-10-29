@@ -57,7 +57,7 @@ def unique_dir(base: Path) -> Path:
     return path
 
 
-def predictions_frame(data: PreparedData, result: TrainResult) -> pd.DataFrame:
+def predictions_frame(data: PreparedData, result: TrainResult, threshold: float = 0.5) -> pd.DataFrame:
     frames = []
     for name in SPLITS:
         if name not in result.evals:
@@ -68,7 +68,7 @@ def predictions_frame(data: PreparedData, result: TrainResult) -> pd.DataFrame:
         frame.insert(0, SPLIT_COLUMN, name)
         frame[TRUE_COLUMN] = split.y
         frame[PROB_COLUMN] = prob
-        frame[PRED_COLUMN] = (prob >= 0.5).astype(np.int64)
+        frame[PRED_COLUMN] = (prob >= threshold).astype(np.int64)
         frames.append(frame)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
@@ -89,7 +89,8 @@ def save_run(
 
     history = pd.DataFrame(result.history, columns=list(HISTORY_COLUMNS))
     history.to_csv(run_dir / HISTORY_FILE, index=False)
-    predictions = predictions_frame(data, result)
+    threshold = cfg.train.threshold
+    predictions = predictions_frame(data, result, threshold)
     predictions.to_csv(run_dir / PREDICTIONS_FILE, index=False, encoding="utf-8-sig")
 
     metrics = {
@@ -100,8 +101,9 @@ def save_run(
         "device": result.device,
         "num_parameters": result.num_parameters,
         "features": list(data.features),
+        "threshold": threshold,
         "splits": {name: {"loss": ev.loss, **ev.metrics} for name, ev in result.evals.items()},
-        "sources": per_source_metrics(predictions),
+        "sources": per_source_metrics(predictions, threshold),
         "scenes": per_scene_accuracy(predictions).to_dict("records"),
         "notes": data.notes,
     }
@@ -118,6 +120,7 @@ def save_run(
             "fill_values": None if data.fill_values is None else data.fill_values.tolist(),
             "scaler_mean": None if data.scaler is None else data.scaler.mean.tolist(),
             "scaler_std": None if data.scaler is None else data.scaler.std.tolist(),
+            "threshold": threshold,
             "state_dict": result.model.state_dict(),
         },
         run_dir / MODEL_FILE,
@@ -155,7 +158,8 @@ def read_predictions(path: Path) -> pd.DataFrame:
 def save_run_figures(run: RunRecord) -> None:
     from . import plots  # matplotlib 只在画图时需要
 
-    plots.save_figures(run.path, run.history, run.metrics.get("best_epoch", 0), split_scores(run.predictions))
+    plots.save_figures(run.path, run.history, run.metrics.get("best_epoch", 0), split_scores(run.predictions),
+                       run.metrics.get("threshold", 0.5))
 
 
 def split_scores(predictions: pd.DataFrame) -> dict[str, tuple[np.ndarray, np.ndarray]]:
@@ -169,7 +173,7 @@ def split_scores(predictions: pd.DataFrame) -> dict[str, tuple[np.ndarray, np.nd
     }
 
 
-def per_source_metrics(predictions: pd.DataFrame) -> dict[str, dict[str, dict]]:
+def per_source_metrics(predictions: pd.DataFrame, threshold: float = 0.5) -> dict[str, dict[str, dict]]:
     """数据来自多个文件夹的集合，按文件夹分别计算指标：{split: {文件夹: 指标}}。"""
     if predictions.empty or SOURCE_COLUMN not in predictions:
         return {}
@@ -177,7 +181,7 @@ def per_source_metrics(predictions: pd.DataFrame) -> dict[str, dict[str, dict]]:
     for split, part in predictions.groupby(SPLIT_COLUMN, sort=False):
         if part[SOURCE_COLUMN].nunique() > 1:
             result[split] = {
-                str(source): binary_metrics(rows[TRUE_COLUMN].to_numpy(), rows[PROB_COLUMN].to_numpy())
+                str(source): binary_metrics(rows[TRUE_COLUMN].to_numpy(), rows[PROB_COLUMN].to_numpy(), threshold)
                 for source, rows in part.groupby(SOURCE_COLUMN, sort=False)
             }
     return result
@@ -218,6 +222,7 @@ class Predictor:
         self.model_name: str = checkpoint["model"]
         self.params: dict = dict(checkpoint["params"])
         self.num_classes: int = checkpoint["num_classes"]
+        self.threshold: float = checkpoint.get("threshold", 0.5)  # 车内概率 ≥ 该值判为车内（旧模型为 0.5）
         self.features: list[str] = list(checkpoint["features"])
         self.fill_values = _array(checkpoint["fill_values"])
         self.mean = _array(checkpoint["scaler_mean"])

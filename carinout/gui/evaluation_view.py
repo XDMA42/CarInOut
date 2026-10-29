@@ -101,7 +101,7 @@ class EvaluationView(QWidget):
             for source, source_values in sources.get(name, {}).items():  # 来自多个文件夹时逐个列出
                 self._add_summary_row(f"    └ {source}", source_values)
         self._fit_summary_height(self.summary_table.rowCount())
-        self.chart.update_scores(split_scores(predictions))
+        self.chart.update_scores(split_scores(predictions), metrics.get("threshold", 0.5))
 
         for rec in _evaluation_rows(per_scene_accuracy(predictions)):
             cells = [

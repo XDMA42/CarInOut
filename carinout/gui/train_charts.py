@@ -38,8 +38,9 @@ class EpochChart(_ChartBase):
         self.canvas.mpl_connect("axes_leave_event", lambda _e: self._hide_cursor())
         self.update_history([], 0)
 
-    def update_history(self, history, best_epoch: int) -> None:
-        self._panels = self._draw(self.figure, history, best_epoch)
+    def update_history(self, history, best_epoch: int, **options) -> None:
+        """options 原样传给 draw，如 draw_metrics 的 threshold。"""
+        self._panels = self._draw(self.figure, history, best_epoch, **options)
         self._cursor = []
         for panel in self._panels:
             ax = panel.ax
@@ -101,15 +102,15 @@ class EvaluationChart(_ChartBase):
         super().__init__(12, 4, parent)
         self.update_scores({})
 
-    def update_scores(self, scores: dict) -> None:
-        plots.draw_evaluation(self.figure, scores)
+    def update_scores(self, scores: dict, threshold: float = 0.5) -> None:
+        plots.draw_evaluation(self.figure, scores, threshold)
         self.canvas.draw_idle()
 
 
 class SweepChart(_ChartBase):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(12, 3.6, parent)
-        self.update_results(None, [], "val_accuracy", "验证集准确率")
+        self.update_results(None, [], "val_balanced_accuracy", "验证集平衡准确率")
 
     def update_results(self, results, axes: list[tuple[str, str]], metric: str, label: str, lower=False) -> None:
         plots.draw_sweep(self.figure, results if results is not None else pd.DataFrame(), axes, metric, label, lower)

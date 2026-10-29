@@ -12,6 +12,7 @@ from carinout.training.cli import main as cli_main
 from carinout.training.config import DataConfig, ExperimentConfig, ModelConfig, OptimConfig
 from carinout.training.data import load_table, prepare_data
 from carinout.training.losses import Objective, class_weights, l2_penalty
+from carinout.training.metrics import binary_metrics
 from carinout.training.models.base import KIND_FLOAT, ModelSpec, ParamSpec
 from carinout.training.runs import (
     MODEL_FILE,
@@ -160,6 +161,44 @@ def test_stop_and_early_stopping(dataset: Path, tmp_path: Path):
     cfg = config(dataset, tmp_path, epochs=500, early_stopping=2, learning_rate=0.05)
     result = fit(cfg, data)
     assert result.early_stopped and len(result.history) == result.best_epoch + 2
+
+
+def test_threshold_and_imbalance(dataset: Path, tmp_path: Path):
+    """判定阈值用于验证集指标、预测结果和保存的模型；样本不平衡时日志提示。"""
+    cfg = config(dataset, tmp_path, epochs=4, threshold=0.8)
+    data = prepare_data(cfg.data, cfg.train.seed)
+    logs = []
+    result = fit(cfg, data, log=logs.append)
+    val = result.evals["val"]
+    assert val.metrics == binary_metrics(data.val.y, val.probs, 0.8)
+    best = result.history[result.best_epoch - 1]  # 最终模型即最佳 epoch 的参数
+    assert best["val_balanced_accuracy"] == pytest.approx(val.metrics["balanced_accuracy"])
+    assert best["val_accuracy"] == pytest.approx(val.metrics["accuracy"])
+    assert any("判定阈值" in m for m in logs)
+    run_dir = new_run_dir(cfg)
+    save_run(run_dir, cfg, data, result, figures=False)
+    run = load_run(run_dir)
+    assert run.metrics["threshold"] == 0.8 and run.config.train.threshold == 0.8
+    pred = run.predictions
+    assert (pred["pred"] == (pred["prob"] >= 0.8).astype(int)).all()
+    assert Predictor.load(run_dir).threshold == 0.8
+    # 旧模型文件没有 threshold，按 0.5
+    checkpoint = torch.load(run_dir / MODEL_FILE, weights_only=True)
+    del checkpoint["threshold"]
+    assert Predictor(checkpoint).threshold == 0.5
+
+    imbalanced = make_dataset(tmp_path / "imb.csv", n_inside=4, n_outside=16, rows_per_point=10)
+    cfg = config(imbalanced, tmp_path, epochs=1)
+    data = prepare_data(cfg.data, cfg.train.seed)
+    logs = []
+    fit(cfg, data, log=logs.append)
+    assert any("样本不平衡" in m and "建议" in m for m in logs)
+    cfg.train.class_weight = "balanced"
+    logs = []
+    fit(cfg, data, log=logs.append)
+    assert any("已按样本数加权" in m for m in logs) and any(m.startswith("类别权重：车外") for m in logs)
+    with pytest.raises(ValueError, match="判定阈值"):
+        config(dataset, tmp_path, threshold=1.0).validate()
 
 
 def test_without_validation_set(dataset: Path, tmp_path: Path):

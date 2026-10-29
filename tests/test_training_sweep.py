@@ -50,12 +50,13 @@ def axis(base: ExperimentConfig, key: str):
 def test_axes_and_aliases(base: ExperimentConfig):
     keys = [a.key for a in available_axes(base)]
     assert keys == ["train.batch_size", "train.learning_rate", "train.l2_lambda", "train.epochs",
-                    "model.hidden_sizes[0]", "model.hidden_sizes[1]", "model.dropout"]
+                    "train.class_weight", "model.hidden_sizes[0]", "model.hidden_sizes[1]", "model.dropout"]
     assert axis(base, "model.hidden_sizes[1]").base == 8
     for name, key in [("bs", "train.batch_size"), ("batch-size", "train.batch_size"), ("lr", "train.learning_rate"),
                       ("l2", "train.l2_lambda"), ("epochs", "train.epochs"), ("hidden1", "model.hidden_sizes[0]"),
                       ("h2", "model.hidden_sizes[1]"), ("model.hidden_sizes[0]", "model.hidden_sizes[0]"),
-                      ("dropout", "model.dropout")]:
+                      ("dropout", "model.dropout"), ("cw", "train.class_weight"),
+                      ("class-weight", "train.class_weight")]:
         assert resolve_axis_key(base, name) == key
     with pytest.raises(ValueError, match="不能遍历"):
         resolve_axis_key(base, "hidden3")  # 基础配置只有两层隐藏层
@@ -66,8 +67,10 @@ def test_parse_values(base: ExperimentConfig):
     assert axis(base, "train.learning_rate").parse("1e-3; 3e-4") == [0.001, 0.0003]
     assert axis(base, "model.hidden_sizes[0]").parse("") == []
     assert axis(base, "model.dropout").parse("0, 0.2，0.5") == [0.0, 0.2, 0.5]
+    assert axis(base, "train.class_weight").parse("none, 按样本数平衡, balanced") == ["none", "balanced"]
     for key, text, message in [("train.batch_size", "32.5", "不是整数"), ("train.learning_rate", "abc", "不是数字"),
-                               ("model.hidden_sizes[0]", "0", "不能小于 1"), ("model.dropout", "1", "不能大于 0.9")]:
+                               ("model.hidden_sizes[0]", "0", "不能小于 1"), ("model.dropout", "1", "不能大于 0.9"),
+                               ("train.class_weight", "auto", "可选")]:
         with pytest.raises(ValueError, match=message):
             axis(base, key).parse(text)
 
@@ -81,6 +84,9 @@ def test_expand_grid(base: ExperimentConfig):
     assert last.train.batch_size == 32 and last.model.params["hidden_sizes"] == [12, 8]
     assert last.train.learning_rate == base.train.learning_rate
     assert base.model.params == {"hidden_sizes": [16, 8]}  # 基础配置不被修改
+    weighted = expand_grid(base, {"train.class_weight": ["none", "balanced"]})
+    assert [t.name for t in weighted] == ["001_cw-none", "002_cw-balanced"]
+    assert weighted[1].config.train.class_weight == "balanced"
     dropout = expand_grid(base, {"model.dropout": [0.0, 0.3]})
     assert [t.name for t in dropout] == ["001_do-0", "002_do-0.3"]
     assert dropout[1].config.model.params == {"hidden_sizes": [16, 8], "dropout": 0.3}

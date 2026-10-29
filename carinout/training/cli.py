@@ -54,7 +54,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--epochs", type=int)
     p.add_argument("--l2", type=float, help="L2 系数 λ")
     p.add_argument("--optimizer", choices=["adam", "sgd"])
-    p.add_argument("--class-weight", choices=["none", "balanced"])
+    p.add_argument("--class-weight", choices=["none", "balanced"], help="balanced：按样本数给交叉熵加权")
+    p.add_argument(
+        "--threshold", type=float, help="判定阈值，车内概率 ≥ 该值判为车内（默认 0.5）；评估时默认用模型保存的阈值"
+    )
     p.add_argument("--early-stopping", type=int, metavar="N", help="验证集交叉熵 N 个 epoch 无改善即停止，0 不停止")
     p.add_argument("--missing", choices=["drop", "mean", "constant"], help="缺失值处理")
     p.add_argument("--split", choices=["point", "row"], help="按点位整组划分 / 按行随机划分")
@@ -70,13 +73,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="参数=值1,值2",
-        help="可重复。参数：bs（batch size）、lr、l2、epochs、hidden1 / hidden2 …（第 N 层隐藏层节点数）、"
-        "dropout，如 --sweep bs=32,64 --sweep hidden1=32,64,128 --sweep dropout=0,0.2",
+        help="可重复。参数：bs（batch size）、lr、l2、epochs、cw（类别权重 none / balanced）、"
+        "hidden1 / hidden2 …（第 N 层隐藏层节点数）、dropout，如 --sweep bs=32,64 --sweep cw=none,balanced",
     )
     g.add_argument(
         "--workers", type=int, default=default_workers(), help="并行训练的进程数（默认约为物理核数，最多 8 个）"
     )
-    g.add_argument("--rank-by", choices=list(RANK_METRICS), default="val_accuracy", help="挑选最佳组合的验证集指标")
+    g.add_argument(
+        "--rank-by", choices=list(RANK_METRICS), default="val_balanced_accuracy", help="挑选最佳组合的验证集指标"
+    )
     e = p.add_argument_group("用已有模型评估（不训练）")
     e.add_argument(
         "--evaluate",
@@ -103,6 +108,7 @@ def apply_args(cfg: ExperimentConfig, args: argparse.Namespace) -> ExperimentCon
         "optimizer": (t, "optimizer"),
         "class_weight": (t, "class_weight"),
         "early_stopping": (t, "early_stopping"),
+        "threshold": (t, "threshold"),
         "seed": (t, "seed"),
         "device": (t, "device"),
         "output_dir": (cfg, "output_dir"),
@@ -172,7 +178,10 @@ def _train(cfg: ExperimentConfig) -> int:
             f"（CE {r['train_ce']:.4f} + L2 {r['l2']:.4f}）  train_acc {r['train_accuracy']:.4f}"
         )
         if not math.isnan(r["val_ce"]):
-            text += f"  val_loss {r['val_loss']:.4f}  val_acc {r['val_accuracy']:.4f}  val_auc {r['val_auc']:.4f}"
+            text += (
+                f"  val_loss {r['val_loss']:.4f}  val_acc {r['val_accuracy']:.4f}"
+                f"  val_bacc {r['val_balanced_accuracy']:.4f}  val_auc {r['val_auc']:.4f}"
+            )
         print(text, flush=True)
 
     print(f"特征（{len(data.features)}）：{', '.join(data.features)}")
@@ -183,7 +192,8 @@ def _train(cfg: ExperimentConfig) -> int:
 
     print(f"\n最佳 epoch：{result.best_epoch}")
     splits = {name: {"loss": ev.loss, **ev.metrics} for name, ev in result.evals.items()}
-    _print_results(splits, predictions_frame(data, result))
+    threshold = cfg.train.threshold
+    _print_results(splits, predictions_frame(data, result, threshold), threshold)
     print(f"\n训练结果已保存到 {run_dir}")
     return 0
 
@@ -193,19 +203,22 @@ def _evaluate(args: argparse.Namespace) -> int:
 
     if args.dataset:
         raise ValueError("评估已有模型时用 --val-dataset / --test-dataset 指定数据（--dataset 是训练数据）")
-    record = evaluate_model(args.evaluate, args.val_dataset or [], args.test_dataset or [], log=print)
+    val, test = args.val_dataset or [], args.test_dataset or []
+    record = evaluate_model(args.evaluate, val, test, log=print, threshold=args.threshold)
     save_evaluation_figure(record)
     print()
-    _print_results(record.metrics["splits"], record.predictions)
+    _print_results(record.metrics["splits"], record.predictions, record.metrics["threshold"])
     return 0
 
 
-def _print_results(splits: dict[str, dict], predictions) -> None:
+def _print_results(splits: dict[str, dict], predictions, threshold: float) -> None:
     """各集合的指标（数据来自多个文件夹时逐个列出），以及验证集、测试集各场景的准确率。"""
     from .runs import per_scene_accuracy, per_source_metrics
 
+    if threshold != 0.5:
+        print(f"判定阈值：车内概率 ≥ {threshold:g} 判为车内")
     print(f"{'':<16}{'样本数':>8}{'交叉熵':>10}" + "".join(f"{name:>10}" for name in METRIC_NAMES.values()))
-    sources = per_source_metrics(predictions)
+    sources = per_source_metrics(predictions, threshold)
     for name, m in splits.items():
         values = "".join(f"{_num(m[k]):>10}" for k in METRIC_NAMES)
         print(f"{SPLIT_NAMES[name]:<16}{m['n']:>8}{_num(m.get('loss')):>10}{values}")
@@ -258,7 +271,10 @@ def _sweep(cfg: ExperimentConfig, args: argparse.Namespace) -> int:
         if row.get("error"):
             text += f"：{row['error']}"
         elif not math.isnan(row.get("val_ce", math.nan)):
-            text += f"  val_acc {row['val_accuracy']:.4f}  val_auc {row['val_auc']:.4f}  val_ce {row['val_ce']:.4f}"
+            text += (
+                f"  val_acc {row['val_accuracy']:.4f}  val_bacc {row['val_balanced_accuracy']:.4f}"
+                f"  val_auc {row['val_auc']:.4f}  val_ce {row['val_ce']:.4f}"
+            )
         if "seconds" in row:
             text += f"  ({row['seconds']:.1f}s)"
         print(text, flush=True)
@@ -267,7 +283,8 @@ def _sweep(cfg: ExperimentConfig, args: argparse.Namespace) -> int:
         path = run_sweep(cfg, trials, args.workers, args.rank_by, on_event, stopped, print)
 
     ranked = rank_results(load_sweep(path).results, args.rank_by)
-    columns = ["name", "status", "val_ce", "val_accuracy", "val_f1", "val_auc", "test_accuracy", "test_auc"]
+    columns = ["name", "status", "val_ce", "val_accuracy", "val_balanced_accuracy", "val_f1", "val_auc",
+               "test_accuracy", "test_balanced_accuracy", "test_auc"]
     print(f"\n按{RANK_METRICS[args.rank_by]}排序的前 10 组：")
     print(ranked[columns].head(10).to_string(index=False, float_format=lambda v: f"{v:.4f}"))
     print(f"\n全部结果：{path / RESULTS_FILE}")

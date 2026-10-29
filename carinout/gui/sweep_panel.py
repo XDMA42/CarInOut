@@ -65,11 +65,13 @@ RESULT_COLUMNS = (
     ("best_epoch", "最佳 epoch", "{:.0f}"),
     ("val_ce", "验证交叉熵", "{:.4f}"),
     ("val_accuracy", "验证准确率", "{:.2%}"),
+    ("val_balanced_accuracy", "验证平衡准确率", "{:.2%}"),
     ("val_precision", "验证精确率", "{:.2%}"),
     ("val_recall", "验证召回率", "{:.2%}"),
     ("val_f1", "验证 F1", "{:.2%}"),
     ("val_auc", "验证 AUC", "{:.4f}"),
     ("test_accuracy", "测试准确率", "{:.2%}"),
+    ("test_balanced_accuracy", "测试平衡准确率", "{:.2%}"),
     ("test_auc", "测试 AUC", "{:.4f}"),
     ("seconds", "耗时 (s)", "{:.1f}"),
 )

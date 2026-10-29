@@ -27,6 +27,20 @@ def test_auc_matches_pairwise_definition():
     assert roc_auc([1, 0], [0.5, 0.5]) == 0.5
 
 
+def test_balanced_accuracy_and_threshold():
+    # 车外 8 个、车内 2 个：全部判为车外时准确率 80%，平衡准确率只有 50%
+    y = np.array([0] * 8 + [1] * 2)
+    lazy = binary_metrics(y, np.full(10, 0.1))
+    assert lazy["accuracy"] == 0.8 and lazy["balanced_accuracy"] == 0.5
+    prob = np.array([0.1] * 7 + [0.6, 0.4, 0.9])
+    assert binary_metrics(y, prob)["confusion"] == [[7, 1], [1, 1]]
+    strict = binary_metrics(y, prob, threshold=0.7)  # 调高阈值：车外误判减少，车内漏判增加
+    assert strict["confusion"] == [[8, 0], [1, 1]]
+    assert strict["balanced_accuracy"] == (1.0 + 0.5) / 2
+    only_outside = binary_metrics(np.array([0, 0]), np.array([0.1, 0.9]))
+    assert only_outside["balanced_accuracy"] == 0.5  # 只有一个类别时取该类的判对比例
+
+
 def test_degenerate_cases():
     assert math.isnan(roc_auc([1, 1], [0.2, 0.8]))
     m = binary_metrics(np.array([0, 0]), np.array([0.1, 0.2]))

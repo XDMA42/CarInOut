@@ -36,7 +36,7 @@ import pandas as pd
 import torch
 
 from .config import ExperimentConfig, OptimConfig
-from .data import SPLITS, PreparedData, prepare_data
+from .data import SPLITS, PreparedData, imbalance_note, prepare_data
 from .models import get_spec
 from .models.base import KIND_CHOICE, KIND_FLOAT, KIND_INT, KIND_INT_LIST
 from .runs import new_run_dir, save_run
@@ -68,13 +68,14 @@ def default_workers() -> int:
 
 # 用来比较各组合的指标；交叉熵越低越好，其余越高越好
 RANK_METRICS = {
+    "val_balanced_accuracy": "验证集平衡准确率",  # 默认：样本不平衡时比准确率更可靠
     "val_accuracy": "验证集准确率",
     "val_f1": "验证集 F1",
     "val_auc": "验证集 AUC",
     "val_ce": "验证集交叉熵",
 }
 LOWER_IS_BETTER = {"val_ce"}
-METRIC_KEYS = ("ce", "accuracy", "precision", "recall", "f1", "auc")
+METRIC_KEYS = ("ce", "accuracy", "balanced_accuracy", "precision", "recall", "f1", "auc")
 
 # 可遍历的训练参数：配置项 → (界面名称, 组合名称中的缩写, 取值示例；为空时按当前值生成)
 TRAIN_AXES = {
@@ -82,6 +83,17 @@ TRAIN_AXES = {
     "learning_rate": ("learning rate", "lr", "0.001, 0.0003"),
     "l2_lambda": ("L2 系数 λ", "l2", "0, 0.0001, 0.001"),
     "epochs": ("epoch 数", "ep", ""),
+    "class_weight": ("类别权重", "cw-", "none, balanced"),
+}
+# 选项类训练参数可用的写法 → 配置值
+CHOICE_ALIASES = {
+    "class_weight": {
+        "none": "none",
+        "不加权": "none",
+        "balanced": "balanced",
+        "按样本数平衡": "balanced",
+        "平衡": "balanced",
+    },
 }
 # 命令行 --sweep 的别名
 ALIASES = {
@@ -90,6 +102,7 @@ ALIASES = {
     "lr": "train.learning_rate",
     "learning-rate": "train.learning_rate",
     "l2": "train.l2_lambda",
+    "cw": "train.class_weight",
 }
 
 
@@ -131,7 +144,8 @@ def available_axes(base: ExperimentConfig) -> list[SweepAxis]:
     defaults = OptimConfig()
     for name, (label, short, example) in TRAIN_AXES.items():
         kind, value = type(getattr(defaults, name)), getattr(base.train, name)
-        axes.append(SweepAxis(f"train.{name}", label, short, value, _number_parser(kind), example or _example(value)))
+        parse = _choice_parser(CHOICE_ALIASES[name]) if name in CHOICE_ALIASES else _number_parser(kind)
+        axes.append(SweepAxis(f"train.{name}", label, short, value, parse, example or _example(value)))
     spec = get_spec(base.model.name)
     params = spec.resolve_params(base.model.params)
     for p in spec.params:
@@ -212,6 +226,10 @@ def run_sweep(
     data = prepare_data(base.data, base.train.seed, log)
     if not len(data.val):
         log("注意：没有验证集，各组合只能按训练集指标比较，建议设置验证集比例")
+    swept_weight = "train.class_weight" in trials[0].overrides
+    note = imbalance_note(data.train.y, None if swept_weight else base.train.class_weight)
+    if note:
+        log(note)
 
     sweep_cfg = ExperimentConfig.from_dict(base.to_dict())
     sweep_cfg.run_name = f"sweep_{base.run_name}" if base.run_name else "sweep"
@@ -543,6 +561,15 @@ def _number_parser(kind: type) -> Callable[[str], Any]:
                 raise ValueError(f"“{text}” 不是整数")
             return int(value)
         return value
+
+    return parse
+
+
+def _choice_parser(aliases: dict[str, str]) -> Callable[[str], str]:
+    def parse(text: str) -> str:
+        if text not in aliases:
+            raise ValueError(f"“{text}” 无效，可选：{'、'.join(aliases)}")
+        return aliases[text]
 
     return parse
 

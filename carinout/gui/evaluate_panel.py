@@ -7,6 +7,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal
 from PySide6.QtWidgets import (
+    QDoubleSpinBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
@@ -32,13 +33,14 @@ class EvaluateWorker(QObject):
     done = Signal(object)  # EvaluationRecord
     failed = Signal(str)
 
-    def __init__(self, model_dir: str, val: list[str], test: list[str]) -> None:
+    def __init__(self, model_dir: str, val: list[str], test: list[str], threshold: float) -> None:
         super().__init__()
         self._args = (model_dir, val, test)
+        self._threshold = threshold
 
     def run(self) -> None:
         try:
-            record = evaluate_model(*self._args, log=self.message.emit)
+            record = evaluate_model(*self._args, log=self.message.emit, threshold=self._threshold)
         except Exception as exc:  # noqa: BLE001 —— 任何异常都要回报给界面，避免线程静默退出
             self.failed.emit(str(exc))
         else:
@@ -68,6 +70,12 @@ class EvaluatePanel(QWidget):
         use_current.clicked.connect(self._use_current)
         self.model_info = QLabel()
         self.model_info.setWordWrap(True)
+        self.threshold_spin = QDoubleSpinBox()
+        self.threshold_spin.setRange(0.01, 0.99)
+        self.threshold_spin.setSingleStep(0.05)
+        self.threshold_spin.setDecimals(2)
+        self.threshold_spin.setValue(0.5)
+        self.threshold_spin.setToolTip("车内概率 ≥ 阈值判为车内；选择模型后自动设为训练时的阈值，可改为其他值比较")
 
         self.val_list = DatasetList(
             "未指定验证集", "共 {n} 个文件夹", browse_dir, lambda: {p: "已在测试集中" for p in self.test_list.paths()}
@@ -86,6 +94,9 @@ class EvaluatePanel(QWidget):
         model_row.addWidget(self.model_edit, 1)
         model_row.addWidget(browse)
         model_row.addWidget(use_current)
+        model_row.addSpacing(12)
+        model_row.addWidget(QLabel("判定阈值"))
+        model_row.addWidget(self.threshold_spin)
         model_row.addSpacing(12)
         model_row.addWidget(self.start_btn)
         grid.addLayout(model_row, 0, 1, 1, 2)
@@ -136,7 +147,8 @@ class EvaluatePanel(QWidget):
             self.model_info.setStyleSheet("color: #d03b3b")
             self.model_info.setText(f"无法加载模型：{exc}")
             return
-        text = f"{predictor.describe()}；{len(predictor.features)} 个输入特征"
+        self.threshold_spin.setValue(predictor.threshold)
+        text = f"{predictor.describe()}；{len(predictor.features)} 个输入特征；训练时判定阈值 {predictor.threshold:g}"
         try:
             datasets = ExperimentConfig.load(Path(path) / CONFIG_FILE).data.datasets
             text += "；训练数据：" + "、".join(dataset_name(p) for p in datasets)
@@ -158,7 +170,9 @@ class EvaluatePanel(QWidget):
         self.start_btn.setText("正在评估…")
         self.view.clear("正在评估…")
         self._thread = QThread(self)
-        self._worker = EvaluateWorker(model, self.val_list.paths(), self.test_list.paths())
+        self._worker = EvaluateWorker(
+            model, self.val_list.paths(), self.test_list.paths(), round(self.threshold_spin.value(), 4)
+        )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.message.connect(self.message)
@@ -195,12 +209,16 @@ class EvaluatePanel(QWidget):
             self.val_list.set_paths(datasets.get("val", []))
             self.test_list.set_paths(datasets.get("test", []))
             self._update_model_info()
+            self.threshold_spin.setValue(m.get("threshold", 0.5))
         used = "，".join(
             f"{SPLIT_NAMES[split]}：" + "、".join(dataset_name(p) for p in datasets[split])
             for split in ("val", "test")
             if split in datasets
         )
-        header = f"{record.path}\n模型 {record.model_dir.name}（{m.get('model_description', '')}）；{used}"
+        header = (
+            f"{record.path}\n模型 {record.model_dir.name}（{m.get('model_description', '')}）；{used}"
+            f"；判定阈值 {m.get('threshold', 0.5):g}"
+        )
         if m.get("notes"):
             header += "\n" + "；".join(m["notes"])
         self.view.show_results(record.path, header, m, record.predictions)

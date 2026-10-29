@@ -148,7 +148,7 @@ python train.py --evaluate runs/20261027-153012_mlp --test-dataset D:/data/merge
 - **Dropout**（可选）：比例大于 0 时，每个隐藏层的 ReLU 后加一层 Dropout，训练时按该比例随机把输出置 0，
   用于减轻过拟合；评估、推理时不生效。默认 0（不使用），可设 0 ~ 0.9，常用 0.1 ~ 0.5。
 - **损失 = 交叉熵 + λ × Σ‖W‖²**：L2 项只对权重计算，不含偏置；两部分分别记录，在损失曲线中单独显示。
-- 输出经 softmax 得到车内概率，≥ 0.5 判为车内；正类 = 车内。
+- 输出经 softmax 得到车内概率，≥ **判定阈值**（默认 0.5）判为车内；正类 = 车内。
 - 训练结束后自动换回**验证集交叉熵最低**那个 epoch 的模型参数（没有验证集时按训练集总损失），评估和保存都用它。
 
 ### 可配置项
@@ -166,7 +166,8 @@ python train.py --evaluate runs/20261027-153012_mlp --test-dataset D:/data/merge
 | epoch 数 | `train.epochs` | `--epochs` | 100 |
 | L2 系数 λ | `train.l2_lambda` | `--l2` | 0.0001 |
 | 优化器 | `train.optimizer`：`adam` / `sgd`（momentum 0.9） | `--optimizer` | adam |
-| 类别权重 | `train.class_weight`：`none` / `balanced` | `--class-weight` | none |
+| 类别权重 | `train.class_weight`：`none` 不加权 / `balanced` 按样本数平衡 | `--class-weight` | none |
+| 判定阈值 | `train.threshold`：车内概率 ≥ 该值判为车内（0 ~ 1） | `--threshold` | 0.5 |
 | 提前停止 | `train.early_stopping`：验证集交叉熵 N 个 epoch 无改善即停，0 不停 | `--early-stopping` | 0 |
 | 缺失值 | `data.missing`：`drop` 丢弃行 / `mean` 训练集均值 / `constant` 固定值（`data.fill_value`） | `--missing` | drop |
 | 标准化 | `data.standardize`：按训练集均值、标准差做 z-score | — | 开 |
@@ -183,11 +184,26 @@ python train.py --evaluate runs/20261027-153012_mlp --test-dataset D:/data/merge
 **为什么默认按点位划分**：同一点位相邻时刻的样本几乎一样，按行随机划分时验证集里的点位训练集都“见过”，
 指标会偏乐观。按 (场景, 点位) 整组划分（并按标签分层），验证 / 测试集衡量的是对**没见过的位置**的判断能力。
 
+### 车内、车外样本不平衡
+
+- **提示**：加载训练数据后，数据概况中会显示两类的行数；多的一类是少的一类的 1.5 倍以上时，
+  数据概况和训练日志都会提示，并建议类别权重选“按样本数平衡”。
+- **类别权重**：“按样本数平衡”时，每类样本的交叉熵乘以 `总行数 / (2 × 该类行数)`，少的一类权重大，
+  两类对损失的总贡献相同；日志中会打印两类的权重。验证集交叉熵（选最佳 epoch、提前停止用）按同样的权重计算。
+  参数遍历中可以把“类别权重”作为一个参数（`none, balanced`），直接比较加权与不加权。
+- **平衡准确率** = (车外判对比例 + 车内判对比例) / 2，即两类召回率的平均。样本不平衡时，模型全部判为多的一类
+  也能得到很高的准确率，平衡准确率则只有 50%。它出现在评价指标曲线、指标表、训练记录中，
+  也是参数遍历默认的“最佳组合依据”。不平衡时以平衡准确率、F1、各场景准确率为主要参考。
+- **判定阈值**：车内概率 ≥ 阈值判为车内，默认 0.5。调高阈值，车外被误判为车内的减少、车内被漏判的增加；调低则相反。
+  阈值只影响准确率、混淆矩阵等按类别计算的指标和预测结果，不影响训练过程、交叉熵和 AUC；
+  会保存到模型中，推理（`Predictor`）和之后的评估默认沿用。ROC 曲线上的圆点标出当前阈值对应的位置，
+  可以看出换一个阈值时误判率和检出率如何变化。
+
 ### 训练可视化
 
 - **损失曲线**：总损失、交叉熵、L2 正则项三张图，训练集与验证集对比，竖线标出最佳 epoch。
   鼠标移到图上显示该 epoch 的数值；工具栏可缩放、平移、保存图片。
-- **评价指标**：验证集的准确率、精确率、召回率、F1、AUC 随 epoch 的变化。
+- **评价指标**：验证集的准确率、平衡准确率、精确率、召回率、F1、AUC 随 epoch 的变化。
 - **评估结果**：上方是最佳模型在训练 / 验证 / 测试集上的指标表（数据来自多个文件夹时逐个文件夹列出），下方分页：
   - **各场景准确率**：验证集、测试集中每个场景（如“中间座椅+脚坑”）的点位数、样本数、准确率和平均车内概率，
     各集合内从低到高排列，低于 80% 标黄；
@@ -206,6 +222,7 @@ python train.py --evaluate runs/20261027-153012_mlp --test-dataset D:/data/merge
 1. 打开“模型评估”页，选择模型：点“浏览…”选训练结果文件夹（含 `model.pt`，参数遍历中某一组的文件夹也可以），
    或点“用当前训练结果”使用刚训练完 / 正在查看的那个。下方会显示模型结构、输入特征数和它的训练数据。
 2. 添加验证集、测试集文件夹（各自可以有多个，用法同左侧的数据集列表），点“开始评估”。
+   “判定阈值”默认是模型训练时的阈值，可以改成别的值看看效果（不需要重新训练）。
 3. 结果与“评估结果”页相同：指标表（逐个文件夹列出）、**各场景准确率**、各点位准确率、混淆矩阵与 ROC。
 
 - 模型按训练时的方式选取特征、填充缺失值、标准化，新数据只需包含训练时用到的特征列。
@@ -221,6 +238,8 @@ python train.py --evaluate runs/20261027-153012_mlp --test-dataset D:/data/merge
 python train.py --evaluate runs/20261027-153012_mlp \
     --val-dataset D:/data/merged/1025采集 --val-dataset D:/data/merged/1026采集 --test-dataset D:/data/merged/1027采集
 ```
+
+加 `--threshold 0.6` 可以换一个判定阈值评估。
 
 输出各集合（及各文件夹）的指标和各场景准确率，结果同样保存在 `eval_时间/` 中。训练结束时命令行也会列出各场景准确率。
 
@@ -238,6 +257,7 @@ python train.py --evaluate runs/20261027-153012_mlp \
 | epoch 数 | `50, 100` |
 | 第 N 层隐藏层节点数（每层一项，层数与左侧“隐藏层节点数”一致） | 第 1 层 `32, 64, 128`，第 2 层 `16, 32` |
 | Dropout 比例 | `0, 0.2, 0.5` |
+| 类别权重 | `none, balanced`（不加权、按样本数平衡） |
 
 留空的参数使用左侧的设置；数据集、特征、数据划分等其余设置也都取自左侧，所有组合共用同一份数据划分。
 上例共 3 × 2 × 3 × 2 = 36 组。
@@ -252,7 +272,8 @@ python train.py --evaluate runs/20261027-153012_mlp \
 - **进度**：表格中每组一行，显示“训练中 12/100”等状态；每完成一组就更新指标、图表和 `results.csv`。
 - **停止**：正在训练的组合在当前 batch 后停止并保存结果（状态“已停止”），尚未开始的组合不再运行（“未运行”）。
   最多等待 30 秒，仍未结束的进程会被强制结束。
-- **比较**：按“最佳组合依据”（验证集准确率 / F1 / AUC / 交叉熵）排序，最佳一行高亮；点击表头可按任一列排序。
+- **比较**：按“最佳组合依据”（默认验证集平衡准确率，也可选准确率 / F1 / AUC / 交叉熵）排序，最佳一行高亮；
+  点击表头可按任一列排序。
   下方图表每个参数一张：横轴为取值，点为各组合，折线为同一取值的平均，橙色为最佳组合，可以看出每个参数的影响。
 - **查看与采用**：双击一行（或“查看训练曲线”）在前几页显示该组合的损失曲线和评估结果；
   “把选中组合载入左侧”用这组参数覆盖左侧配置，可继续微调或单独训练。
@@ -263,11 +284,12 @@ python train.py --evaluate runs/20261027-153012_mlp \
 ```bash
 python train.py --config configs/mlp.json --workers 8 \
     --sweep bs=32,64,128 --sweep lr=1e-3,3e-4 --sweep hidden1=32,64,128 --sweep hidden2=16,32 \
-    --sweep dropout=0,0.2
+    --sweep dropout=0,0.2 --sweep cw=none,balanced
 ```
 
-`--sweep` 可用的参数名：`bs`（batch size）、`lr`、`l2`、`epochs`、`hidden1` / `hidden2` …（第 N 层隐藏层节点数）、`dropout`；
-`--rank-by` 选择排序指标（`val_accuracy` / `val_f1` / `val_auc` / `val_ce`）。按 Ctrl+C 停止，已训练的结果会保存。
+`--sweep` 可用的参数名：`bs`（batch size）、`lr`、`l2`、`epochs`、`hidden1` / `hidden2` …（第 N 层隐藏层节点数）、
+`dropout`、`cw`（类别权重：`none` / `balanced`）；`--rank-by` 选择排序指标（`val_balanced_accuracy`（默认）/
+`val_accuracy` / `val_f1` / `val_auc` / `val_ce`）。按 Ctrl+C 停止，已训练的结果会保存。
 
 结果保存在 `runs/时间_sweep/`：`results.csv`（每组一行：参数取值、状态、最佳 epoch、训练 / 验证 / 测试集指标、耗时）、
 `sweep.json`（基础配置与遍历取值），以及每组一个普通的训练结果文件夹，如 `007_bs32_lr0.003_h1-32_h2-8/`。
@@ -282,7 +304,7 @@ python train.py --config configs/mlp.json --workers 8 \
 | `history.csv` | 每个 epoch 的损失与验证集指标 |
 | `metrics.json` | 最佳模型在各数据集上的指标、混淆矩阵 `[[TN, FP], [FN, TP]]`、按文件夹的指标（`sources`）、各场景准确率（`scenes`），以及数据划分说明 |
 | `predictions.csv` | 每个样本的 `split, source`（来自哪个文件夹）`, ts, scene, point, label, prob`（车内概率）`, pred` |
-| `model.pt` | 模型参数 + 特征列表 + 缺失值填充值 + 标准化参数 |
+| `model.pt` | 模型参数 + 特征列表 + 缺失值填充值 + 标准化参数 + 判定阈值 |
 | `loss.png` / `metrics.png` / `evaluation.png` | 图表 |
 | `eval_时间/` | 之后用该模型做的评估（见[用已有模型评估](#用已有模型评估)） |
 
@@ -294,6 +316,7 @@ from carinout.training.runs import Predictor
 
 predictor = Predictor.load("runs/20261027-153012_mlp")    # 结果文件夹或其中的 model.pt
 prob = predictor.predict_proba(load_table("D:/data/merged/1027采集/_dataset.csv"))  # 车内概率
+inside = prob >= predictor.threshold                      # 按训练时的判定阈值判为车内
 ```
 
 ### 更换模型（模块化）
@@ -305,7 +328,7 @@ carinout/training/
   models/      模型注册表：base.py（ModelSpec / ParamSpec）、mlp.py
   losses.py    交叉熵 + L2
   trainer.py   训练循环、最佳 epoch、提前停止、评估
-  metrics.py   准确率 / 精确率 / 召回率 / F1 / AUC / ROC / 混淆矩阵
+  metrics.py   准确率 / 平衡准确率 / 精确率 / 召回率 / F1 / AUC / ROC / 混淆矩阵
   plots.py     图表（界面与 PNG 共用）
   runs.py      训练结果保存 / 读取，Predictor 推理
   evaluate.py  用已有模型评估新的验证集 / 测试集

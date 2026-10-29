@@ -60,6 +60,7 @@ class OptimConfig:
     optimizer: str = "adam"
     class_weight: str = "none"  # balanced：按类别样本数的倒数给交叉熵加权
     early_stopping: int = 0  # 验证集交叉熵连续这么多个 epoch 没有改善就停止；0 表示不提前停止
+    threshold: float = 0.5  # 判定阈值：车内概率 ≥ 该值判为车内；保存在模型中，推理和评估时沿用
     seed: int = 42  # 同时用于数据划分和模型初始化
     device: str = "auto"
 
@@ -96,6 +97,8 @@ class ExperimentConfig:
             errors.append(f"train.optimizer 应为 {'/'.join(OPTIMIZER_CHOICES)}")
         if t.class_weight not in CLASS_WEIGHT_CHOICES:
             errors.append(f"train.class_weight 应为 {'/'.join(CLASS_WEIGHT_CHOICES)}")
+        if not 0 < t.threshold < 1:
+            errors.append("判定阈值应在 0 ~ 1 之间（不含 0 和 1）")
         if t.early_stopping < 0:
             errors.append("提前停止的 epoch 数不能为负")
         if t.device not in DEVICE_CHOICES:

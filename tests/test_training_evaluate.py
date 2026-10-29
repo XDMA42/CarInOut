@@ -106,6 +106,21 @@ def test_evaluate_warns_about_training_data_and_errors(trained, tmp_path: Path):
         evaluate_model(run_dir, [str(merged / "day3")], [])
 
 
+def test_evaluate_threshold(trained):
+    run_dir, merged = trained
+    default = evaluate_model(run_dir, [str(merged / "day2")], [])
+    assert default.metrics["threshold"] == 0.5  # 模型训练时的阈值
+    strict = evaluate_model(run_dir, [str(merged / "day2")], [], threshold=0.9)
+    assert strict.metrics["threshold"] == 0.9
+    pred = strict.predictions
+    assert (pred["pred"] == (pred["prob"] >= 0.9).astype(int)).all()
+    (tn, fp), (fn, tp) = strict.metrics["splits"]["val"]["confusion"]
+    (tn0, fp0), _ = default.metrics["splits"]["val"]["confusion"]
+    assert fp <= fp0  # 阈值越高，车外误判为车内越少
+    with pytest.raises(ValueError, match="判定阈值"):
+        evaluate_model(run_dir, [str(merged / "day2")], [], threshold=0)
+
+
 def test_rows_with_missing_features_are_skipped_when_trained_with_drop(tmp_path: Path):
     train = day(tmp_path, "train", seed=1, points=6)
     holes = day(tmp_path, "holes", seed=2, missing_rate=0.2)

@@ -5,7 +5,7 @@ import pandas as pd
 import pytest
 
 from carinout.training.config import DataConfig
-from carinout.training.data import feature_candidates, load_table, prepare_data, split_indices
+from carinout.training.data import feature_candidates, imbalance_note, load_table, prepare_data, split_indices
 from synthetic import make_dataset
 
 
@@ -34,6 +34,15 @@ def test_feature_candidates_skip_meta_and_non_numeric(tmp_path: Path):
     assert list(infos) == ["rssi_FL", "chan_FL", "rssi_FR"]
     assert infos["chan_FL"].constant and not infos["rssi_FL"].constant
     assert infos["rssi_FR"].missing_ratio == 0.5
+
+
+def test_imbalance_note():
+    assert imbalance_note([0] * 12 + [1] * 10, "none") is None  # 1.2 倍，不提示
+    note = imbalance_note([0] * 30 + [1] * 10, "none")
+    assert "车外是车内的 3.0 倍" in note and "按样本数平衡" in note
+    assert imbalance_note([0] * 10 + [1] * 30, "balanced").endswith("已按样本数加权")
+    assert "遍历" in imbalance_note([0] * 30 + [1] * 10, None)
+    assert imbalance_note([0] * 5, "none") is None  # 只有一类时由其他检查报错
 
 
 def test_split_by_point_keeps_points_together(dataset: Path):

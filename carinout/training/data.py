@@ -9,6 +9,7 @@ ts / ts_* / errcode_* 以及 scene、point、label 不作为特征；其余能�
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,6 +38,7 @@ SPLIT_NAMES = {"train": "训练集", "val": "验证集", "test": "测试集"}
 SOURCE_COLUMN = "source"  # 数据来自哪个文件夹（_dataset.csv 所在文件夹名）
 META_COLUMNS = (SOURCE_COLUMN, TS_COLUMN, SCENE_COLUMN, POINT_COLUMN)  # 随预测结果一起保存，便于按点位分析
 EXCLUDED_PREFIXES = (f"{TS_COLUMN}_", "errcode_")
+IMBALANCE_RATIO = 1.5  # 两类样本数之比达到该值时提示样本不平衡
 
 
 @dataclass(frozen=True)
@@ -163,6 +165,28 @@ def partial_columns(tables: list[pd.DataFrame], label_column: str) -> list[str]:
     excluded = {c.lower() for c in (*META_COLUMNS, label_column)}
     seen = list(dict.fromkeys(c for t in tables for c in t.columns))
     return [c for c in seen if c.lower() not in excluded and any(c not in t.columns for t in tables)]
+
+
+def class_ratio(labels) -> tuple[int, int, float]:
+    """(车外行数, 车内行数, 多的一类 / 少的一类)；有一类为 0 时比例为 inf。"""
+    labels = np.asarray(labels)
+    outside, inside = int((labels == LABEL_OUTSIDE).sum()), int((labels == LABEL_INSIDE).sum())
+    low, high = sorted((outside, inside))
+    return outside, inside, (high / low if low else math.inf)
+
+
+def imbalance_note(labels, class_weight: str | None) -> str | None:
+    """训练集两类样本数相差较大时的提示；比较平衡时返回 None。class_weight 为 None 表示类别权重在参数遍历中。"""
+    outside, inside, ratio = class_ratio(labels)
+    if ratio < IMBALANCE_RATIO or not math.isfinite(ratio):
+        return None
+    more, less = ("车外", "车内") if outside > inside else ("车内", "车外")
+    text = f"训练集样本不平衡：车外 {outside:,} 行，车内 {inside:,} 行，{more}是{less}的 {ratio:.1f} 倍"
+    if class_weight == "balanced":
+        return text + "，已按样本数加权"
+    if class_weight is None:
+        return text + "，类别权重在本次遍历的参数中"
+    return text + "。建议“类别权重”选“按样本数平衡”，并以平衡准确率、F1、召回率为主要参考"
 
 
 def default_features(infos: list[FeatureInfo]) -> list[str]:

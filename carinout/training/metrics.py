@@ -6,6 +6,7 @@ import numpy as np
 
 METRIC_NAMES = {
     "accuracy": "准确率",
+    "balanced_accuracy": "平衡准确率",  # 车内、车外各自判对比例的平均，不受样本数不平衡影响
     "precision": "精确率",
     "recall": "召回率",
     "f1": "F1",
@@ -45,7 +46,8 @@ def roc_auc(y_true: np.ndarray, score: np.ndarray) -> float:
 
 
 def binary_metrics(y_true: np.ndarray, prob: np.ndarray, threshold: float = 0.5) -> dict:
-    """prob 为正类（车内）概率。没有样本时各指标为 NaN；分母为 0 的精确率 / 召回率记为 0。"""
+    """prob 为正类（车内）概率，≥ threshold 判为车内。没有样本时各指标为 NaN；分母为 0 的精确率 / 召回率记为 0。
+    平衡准确率为样本中出现的各类别召回率（判对比例）的平均。"""
     y_true = np.asarray(y_true, dtype=np.int64)
     prob = np.asarray(prob, dtype=np.float64)
     y_pred = (prob >= threshold).astype(np.int64)
@@ -55,9 +57,11 @@ def binary_metrics(y_true: np.ndarray, prob: np.ndarray, threshold: float = 0.5)
     precision = tp / (tp + fp) if tp + fp else 0.0
     recall = tp / (tp + fn) if tp + fn else 0.0
     nan = float("nan")
+    class_recalls = [cm[c, c] / cm[c].sum() for c in range(2) if cm[c].sum()]
     return {
         "n": n,
         "accuracy": float((tp + tn) / n) if n else nan,
+        "balanced_accuracy": float(np.mean(class_recalls)) if class_recalls else nan,
         "precision": float(precision) if n else nan,
         "recall": float(recall) if n else nan,
         "f1": float(2 * precision * recall / (precision + recall)) if precision + recall else (0.0 if n else nan),

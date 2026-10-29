@@ -31,6 +31,7 @@
     "l2_lambda": 0.0001,
     "optimizer": "adam",
     "class_weight": "none",
+    "threshold": 0.5,
     "early_stopping": 0,
     "seed": 42,
     "device": "auto"
