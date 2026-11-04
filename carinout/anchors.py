@@ -1,6 +1,6 @@
 """锚点定义与配置持久化。
 
-10 个锚点的位置固定（车外 8 个：四角 + 十字；车内 2 个），
+12 个锚点的位置固定（车外 10 个：四角 + 十字 + 左右后视镜；车内 2 个），
 名称可在界面中修改，修改结果和 SLAVE→锚点 的映射一起保存到 config.json。
 """
 
@@ -17,7 +17,8 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 
 @dataclass(frozen=True)
 class AnchorSlot:
-    """一个锚点位置。x、y 为相对车身的归一化坐标：(0,0) 车身左上角，(1,1) 右下角，车头朝上。"""
+    """一个锚点位置。x、y 为相对车身的归一化坐标：(0,0) 车身左上角，(1,1) 右下角，车头朝上；
+    x < 0 或 x > 1 表示伸出车身之外（后视镜）。"""
 
     key: str
     default_name: str
@@ -27,7 +28,7 @@ class AnchorSlot:
     inside: bool
 
 
-# 顺序即合并后输出列的顺序
+# 顺序即合并后输出列的顺序，也是“按编号分配”的顺序；新锚点追加在末尾，已有锚点的顺序和编号保持不变
 ANCHOR_SLOTS: tuple[AnchorSlot, ...] = (
     AnchorSlot("front_left", "FL", "左前角", 0.0, 0.0, False),
     AnchorSlot("front", "F", "车头正中", 0.5, 0.0, False),
@@ -39,6 +40,8 @@ ANCHOR_SLOTS: tuple[AnchorSlot, ...] = (
     AnchorSlot("left", "L", "左侧正中", 0.0, 0.5, False),
     AnchorSlot("inside_front", "IF", "车内前部", 0.5, 0.36, True),
     AnchorSlot("inside_rear", "IR", "车内后部", 0.5, 0.72, True),
+    AnchorSlot("mirror_left", "LM", "左后视镜", -0.06, 0.277, False),
+    AnchorSlot("mirror_right", "RM", "右后视镜", 1.06, 0.277, False),
 )
 
 SLOT_KEYS = tuple(s.key for s in ANCHOR_SLOTS)
