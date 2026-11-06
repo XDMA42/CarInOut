@@ -21,10 +21,12 @@ COMBINED_FILENAME = "_dataset.csv"
 JOIN_INNER = "inner"  # 只保留所有锚点都有数据的 ts
 JOIN_OUTER = "outer"  # 保留任一锚点出现过的 ts，缺数据的锚点补空
 
-# 总表中追加的列；label：0 = 车外，1 = 车内
+# 总表中追加的列；label：0 = 车外，1 = 车内；sub_scene / sub_label：小场景类别名 / 编号
 SCENE_COLUMN = "scene"
 POINT_COLUMN = "point"
 LABEL_COLUMN = "label"
+SUB_SCENE_COLUMN = "sub_scene"
+SUB_LABEL_COLUMN = "sub_label"
 LABEL_OUTSIDE = 0
 LABEL_INSIDE = 1
 
@@ -258,6 +260,7 @@ def build_dataset(
     out_dir: Path,
     options: MergeOptions | None = None,
     scene_labels: dict[str, int] | None = None,
+    scene_subs: dict[str, tuple[int, str]] | None = None,
     progress: Callable[[int, int], None] | None = None,
     log: Callable[[str], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
@@ -267,6 +270,8 @@ def build_dataset(
     slave_to_anchor: SLAVE 标识 → 锚点名；anchor_order: 输出列中锚点的先后顺序。
     scene_labels: 场景 → 标签（0 车外 / 1 车内）；不为 None 时另写出总表 _dataset.csv，
                   只包含已标注场景，末尾追加 scene、point、label 三列。
+    scene_subs: 场景 → (小场景编号, 小场景名)；不为空时总表再追加 sub_scene、sub_label 两列，
+                未标注小场景的场景这两列留空。
     """
     options = options or MergeOptions()
     log = log or (lambda _msg: None)
@@ -291,9 +296,11 @@ def build_dataset(
                 log(f"[{scene}_{point}] 锚点 {name} 读取失败：{data.error_file}: {data.error}")
         log(f"[{scene}_{point}] {result.status}")
         if merged is not None and scene_labels is not None and scene in scene_labels:
-            labeled_frames.append(
-                merged.assign(**{SCENE_COLUMN: scene, POINT_COLUMN: point, LABEL_COLUMN: scene_labels[scene]})
-            )
+            extra = {SCENE_COLUMN: scene, POINT_COLUMN: point, LABEL_COLUMN: scene_labels[scene]}
+            if scene_subs:
+                sub_id, sub_name = scene_subs.get(scene, ("", ""))
+                extra.update({SUB_SCENE_COLUMN: sub_name, SUB_LABEL_COLUMN: str(sub_id)})
+            labeled_frames.append(merged.assign(**extra))
             for name, data in result.anchors.items():
                 if data.valid is not None:
                     seen = columns_by_anchor[name]
@@ -301,12 +308,13 @@ def build_dataset(
         if progress:
             progress(i, total)
 
-    _write_summary(results, expected, scene_labels, out_dir / SUMMARY_FILENAME, options.output_encoding)
+    _write_summary(results, expected, scene_labels, scene_subs, out_dir / SUMMARY_FILENAME, options.output_encoding)
     if scene_labels is not None:
         columns = (
             [TS_COLUMN]
             + [c for name in expected for c in columns_by_anchor[name]]
             + [SCENE_COLUMN, POINT_COLUMN, LABEL_COLUMN]
+            + ([SUB_SCENE_COLUMN, SUB_LABEL_COLUMN] if scene_subs else [])
         )
         combined = (
             pd.concat(labeled_frames, ignore_index=True).reindex(columns=columns)
@@ -370,6 +378,7 @@ def _write_summary(
     results: list[PointResult],
     anchor_order: list[str],
     scene_labels: dict[str, int] | None,
+    scene_subs: dict[str, tuple[int, str]] | None,
     path: Path,
     encoding: str,
 ) -> None:
@@ -379,6 +388,7 @@ def _write_summary(
             "场景": r.scene,
             "点位": r.point,
             "标签": (scene_labels or {}).get(r.scene, ""),
+            "小场景": " ".join(map(str, (scene_subs or {}).get(r.scene, ()))),
             "输出文件": r.output.name if r.output else "",
             "输出行数": r.rows,
             "状态": r.status,

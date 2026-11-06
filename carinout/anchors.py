@@ -73,6 +73,12 @@ class AppConfig:
     last_output_dir: str = ""
     # 场景 → 标签（0 车外 / 1 车内）；未出现的场景视为未标注
     scene_labels: dict[str, int] = field(default_factory=dict)
+    # 小场景类别：编号 → 名称。编号创建后固定，删除类别不会改变其他类别的编号
+    sub_categories: dict[int, str] = field(default_factory=dict)
+    # 场景 → 小场景类别编号；未出现的场景视为未标注
+    scene_subs: dict[str, int] = field(default_factory=dict)
+    # 下一个新类别的编号；删除过的编号不再复用，避免同一编号前后代表不同类别
+    next_sub_id: int = 0
 
     @classmethod
     def load(cls, path: Path | None = None) -> "AppConfig":
@@ -94,6 +100,10 @@ class AppConfig:
             for slave, key in (data.get("slave_mapping") or {}).items()
             if key in names
         }
+        categories: dict[int, str] = {}
+        for cid, name in (data.get("sub_categories") or {}).items():
+            if str(cid).isdigit() and isinstance(name, str) and name.strip():
+                categories[int(cid)] = name.strip()
         pattern = data.get("filename_pattern") or DEFAULT_PATTERN
         if pattern in LEGACY_DEFAULT_PATTERNS:
             pattern = DEFAULT_PATTERN
@@ -108,6 +118,16 @@ class AppConfig:
                 for scene, label in (data.get("scene_labels") or {}).items()
                 if type(label) is int and label in (0, 1)
             },
+            sub_categories=dict(sorted(categories.items())),
+            next_sub_id=max(
+                data["next_sub_id"] if type(data.get("next_sub_id")) is int else 0,
+                max(categories, default=-1) + 1,
+            ),
+            scene_subs={
+                scene: cid
+                for scene, cid in (data.get("scene_subs") or {}).items()
+                if type(cid) is int and cid in categories
+            },
         )
 
     def save(self, path: Path | None = None) -> None:
@@ -120,5 +140,35 @@ class AppConfig:
             "last_input_dir": self.last_input_dir,
             "last_output_dir": self.last_output_dir,
             "scene_labels": self.scene_labels,
+            "sub_categories": {str(cid): name for cid, name in self.sub_categories.items()},
+            "scene_subs": self.scene_subs,
+            "next_sub_id": self.next_sub_id,
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # ---- 小场景类别 ----
+    def add_sub_category(self, name: str) -> int:
+        """新建小场景类别并返回编号（从 0 开始递增，删除过的编号不复用）。"""
+        cid = max(self.next_sub_id, max(self.sub_categories, default=-1) + 1)
+        self.sub_categories[cid] = name.strip()
+        self.next_sub_id = cid + 1
+        return cid
+
+    def remove_sub_category(self, cid: int) -> list[str]:
+        """删除类别，并清除使用它的场景标注；返回受影响的场景。"""
+        self.sub_categories.pop(cid, None)
+        scenes = [scene for scene, c in self.scene_subs.items() if c == cid]
+        for scene in scenes:
+            del self.scene_subs[scene]
+        return scenes
+
+    def validate_sub_category_name(self, name: str, cid: int | None = None) -> str | None:
+        """返回错误信息；名称合法时返回 None。cid 为正在重命名的类别。"""
+        name = name.strip()
+        if not name:
+            return "名称不能为空"
+        if any(ch in name for ch in ',"\r\n'):
+            return "名称不能包含逗号、引号或换行"
+        if any(n == name for c, n in self.sub_categories.items() if c != cid):
+            return f"类别“{name}”已存在"
+        return None

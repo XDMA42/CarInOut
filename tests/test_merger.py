@@ -150,6 +150,27 @@ def test_combined_dataset_with_labels(folder: Path):
     assert summary.set_index("场景")["标签"].to_dict() == {"座椅": "1", "车外": "0"}
 
 
+def test_combined_dataset_with_sub_scenes(folder: Path):
+    parsed, _ = scan_folder(folder)
+    out = folder.parent / "out"
+    build_dataset(
+        group_by_point(parsed), {"SLAVE1": "FL", "SLAVE2": "FR"}, ["FL", "FR"], out, MergeOptions(),
+        scene_labels={"座椅": 1, "车外": 0}, scene_subs={"座椅": (2, "中排")},
+    )
+    df = read_out(out / COMBINED_FILENAME)
+    assert list(df.columns)[-5:] == ["scene", "point", "label", "sub_scene", "sub_label"]
+    seat, outside = df[df["scene"] == "座椅"], df[df["scene"] == "车外"]
+    assert set(seat["sub_scene"]) == {"中排"} and set(seat["sub_label"]) == {"2"}
+    assert set(outside["sub_scene"]) == {""} and set(outside["sub_label"]) == {""}  # 未标注小场景留空
+    summary = read_out(out / SUMMARY_FILENAME)
+    assert summary.set_index("场景")["小场景"].to_dict() == {"座椅": "2 中排", "车外": ""}
+
+
+def test_no_sub_columns_without_sub_scenes(folder: Path):
+    out, _ = run(folder, {"SLAVE1": "FL", "SLAVE2": "FR"}, labels={"座椅": 1})
+    assert list(read_out(out / COMBINED_FILENAME).columns)[-1] == "label"
+
+
 def test_combined_dataset_skips_unlabeled_scenes(folder: Path):
     out, _ = run(folder, {"SLAVE1": "FL", "SLAVE2": "FR"}, labels={"座椅": 1})
     df = read_out(out / COMBINED_FILENAME)

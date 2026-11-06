@@ -79,3 +79,43 @@ def test_scene_labels_roundtrip(tmp_path: Path):
     config.scene_labels["脚坑"] = 1
     config.save(cfg)
     assert AppConfig.load(cfg).scene_labels == {"座椅": 1, "车外": 0, "脚坑": 1}
+
+
+def test_sub_categories_ids_are_stable(tmp_path: Path):
+    from carinout.anchors import AppConfig
+
+    cfg = tmp_path / "config.json"
+    config = AppConfig.load(cfg)
+    front, trunk = config.add_sub_category("前排"), config.add_sub_category(" 后备箱 ")
+    assert (front, trunk) == (0, 1) and config.sub_categories[trunk] == "后备箱"
+    config.scene_subs.update({"中排座椅": front, "后备箱左": trunk, "后备箱右": trunk})
+
+    # 删除编号最大的类别后再新建，也不会复用它的编号
+    assert sorted(config.remove_sub_category(trunk)) == ["后备箱右", "后备箱左"]
+    assert config.scene_subs == {"中排座椅": front}
+    assert config.add_sub_category("车外左侧") == 2
+
+    config.save(cfg)
+    loaded = AppConfig.load(cfg)
+    assert loaded.sub_categories == {0: "前排", 2: "车外左侧"}
+    assert loaded.scene_subs == {"中排座椅": 0}
+    assert loaded.add_sub_category("车外右侧") == 3
+
+
+def test_sub_category_validation_and_bad_config(tmp_path: Path):
+    import json
+
+    from carinout.anchors import AppConfig
+
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "sub_categories": {"0": "前排", "x": "坏编号", "3": ""},
+        "scene_subs": {"a": 0, "b": 5, "c": "0"},
+    }), encoding="utf-8")
+    config = AppConfig.load(cfg)
+    assert config.sub_categories == {0: "前排"}
+    assert config.scene_subs == {"a": 0}
+    assert config.validate_sub_category_name("前排") is not None
+    assert config.validate_sub_category_name("前排", cid=0) is None  # 重命名为自己
+    assert config.validate_sub_category_name("  ") is not None
+    assert config.validate_sub_category_name("后排") is None
