@@ -53,9 +53,11 @@ from ..merger import (
 )
 from ..parser import DEFAULT_PATTERN, group_by_point, natural_key, scan_folder
 from .car_view import CarView, Coverage
+from .sub_dialog import SubCategoryDialog, ask_new_sub_category
 
 ROLE_POINT = Qt.ItemDataRole.UserRole
 LABEL_TEXT = {LABEL_INSIDE: "1 车内", LABEL_OUTSIDE: "0 车外"}
+NEW_SUB = -1  # 小场景下拉框中“新建类别…”选项的数据
 WARN_BG = QColor(245, 158, 11, 60)
 ERROR_BG = QColor(220, 38, 38, 70)
 
@@ -67,10 +69,10 @@ class ExportWorker(QObject):
     failed = Signal(str)
 
     def __init__(
-        self, groups, slave_to_anchor, anchor_order, out_dir: Path, options: MergeOptions, scene_labels
+        self, groups, slave_to_anchor, anchor_order, out_dir: Path, options: MergeOptions, scene_labels, scene_subs
     ) -> None:
         super().__init__()
-        self._args = (groups, slave_to_anchor, anchor_order, out_dir, options, scene_labels)
+        self._args = (groups, slave_to_anchor, anchor_order, out_dir, options, scene_labels, scene_subs)
         self._cancel = False
 
     def cancel(self) -> None:
@@ -108,6 +110,7 @@ class MainWindow(QMainWindow):
         self._out_dir: Path | None = None
         self._input_dir: Path | None = None  # 当前已解析的原始数据文件夹
         self._combos: dict[str, QComboBox] = {}
+        self._sub_combos: dict[str, QComboBox] = {}  # 场景 → 小场景下拉框
 
         self.car = CarView()
         self.car.set_names(self.config.anchor_names)
@@ -127,7 +130,7 @@ class MainWindow(QMainWindow):
         top.addWidget(self.car)
         top.addWidget(right)
         top.setStretchFactor(1, 1)
-        top.setSizes([330, 780, 370])
+        top.setSizes([470, 640, 370])
 
         main = QSplitter(Qt.Orientation.Vertical)
         main.addWidget(top)
@@ -182,8 +185,14 @@ class MainWindow(QMainWindow):
         self.stats_label.setWordWrap(True)
 
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["场景 / 点位", "SLAVE", "文件", "标签"])
+        self.tree.setHeaderLabels(["场景 / 点位", "SLAVE", "文件", "标签", "小场景"])
         self.tree.headerItem().setToolTip(3, "为每个场景选择类别：1 = 车内，0 = 车外（写入总表的 label 列）")
+        self.tree.headerItem().setToolTip(4, "为每个场景选择小场景类别（写入总表的 sub_scene / sub_label 列）")
+        manage_subs = QPushButton("管理小场景类别…")
+        manage_subs.clicked.connect(self._manage_sub_categories)
+        srow = QHBoxLayout()
+        srow.addWidget(self.stats_label, 1)
+        srow.addWidget(manage_subs, 0, Qt.AlignmentFlag.AlignBottom)
         self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.tree.header().setStretchLastSection(False)
         self.tree.setUniformRowHeights(True)
@@ -194,7 +203,7 @@ class MainWindow(QMainWindow):
         lay.addLayout(row)
         lay.addWidget(QLabel("文件名规则（场景 / 点位 / 锚点）"))
         lay.addLayout(prow)
-        lay.addWidget(self.stats_label)
+        lay.addLayout(srow)
         lay.addWidget(self.tree, 1)
         return box
 
@@ -271,9 +280,12 @@ class MainWindow(QMainWindow):
         self.complete_check = QCheckBox("只导出已映射锚点齐全的点位")
         self.complete_check.setToolTip("勾选后，任一已映射锚点在该点位缺失文件、读取失败或没有 errcode=0 的行，整个点位都不导出")
         self.complete_check.toggled.connect(self._refresh_point)
-        self.combined_check = QCheckBox(f"生成总表 {COMBINED_FILENAME}（追加 scene / point / label 列）")
+        self.combined_check = QCheckBox(f"生成总表 {COMBINED_FILENAME}（追加 scene / point / label 等列）")
         self.combined_check.setChecked(True)
-        self.combined_check.setToolTip("所有已标注场景的数据合在一个文件里，label：1 = 车内，0 = 车外；未标注的场景不写入总表")
+        self.combined_check.setToolTip(
+            "所有已标注车内/车外的场景合在一个文件里，末尾追加 scene、point、label（1 = 车内，0 = 车外）；\n"
+            "有小场景标注时再追加 sub_scene（类别名）、sub_label（类别编号）。未标注车内/车外的场景不写入总表。"
+        )
         self.encoding_combo = QComboBox()
         self.encoding_combo.addItem("UTF-8 with BOM（Excel 可直接打开）", "utf-8-sig")
         self.encoding_combo.addItem("UTF-8", "utf-8")
@@ -420,9 +432,57 @@ class MainWindow(QMainWindow):
             combo.setCurrentIndex(max(combo.findData(self.config.scene_labels.get(scene)), 0))
             combo.currentIndexChanged.connect(lambda _i, sc=scene, c=combo: self._on_label_changed(sc, c))
             self.tree.setItemWidget(item, 3, combo)
+        self._sub_combos.clear()
+        for scene, item in scene_items.items():
+            combo = QComboBox()
+            self._fill_sub_combo(combo, scene)
+            combo.currentIndexChanged.connect(lambda _i, sc=scene, c=combo: self._on_sub_changed(sc, c))
+            self.tree.setItemWidget(item, 4, combo)
+            self._sub_combos[scene] = combo
         self.tree.expandAll()
-        for col in (1, 2, 3):
+        for col in (1, 2, 3, 4):
             self.tree.resizeColumnToContents(col)
+
+    def _fill_sub_combo(self, combo: QComboBox, scene: str) -> None:
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("未标注", None)
+        for cid, name in self.config.sub_categories.items():
+            combo.addItem(f"{cid} {name}", cid)
+        combo.addItem("＋ 新建类别…", NEW_SUB)
+        combo.setCurrentIndex(max(combo.findData(self.config.scene_subs.get(scene)), 0))
+        combo.blockSignals(False)
+
+    def _refresh_sub_combos(self) -> None:
+        for scene, combo in self._sub_combos.items():
+            self._fill_sub_combo(combo, scene)
+        self.tree.resizeColumnToContents(4)
+
+    def _on_sub_changed(self, scene: str, combo: QComboBox) -> None:
+        cid = combo.currentData()
+        if cid == NEW_SUB:
+            cid = ask_new_sub_category(self, self.config)
+            if cid is None:  # 取消：恢复原来的选择
+                self._fill_sub_combo(combo, scene)
+                return
+            self._log(f"新建小场景类别 {cid}：{self.config.sub_categories[cid]}")
+        if cid is None:
+            self.config.scene_subs.pop(scene, None)
+        else:
+            self.config.scene_subs[scene] = cid
+        self._after_labels_changed(scene)
+
+    def _manage_sub_categories(self) -> None:
+        SubCategoryDialog(self.config, self).exec()
+        self._after_labels_changed()
+
+    def _after_labels_changed(self, scene: str | None = None) -> None:
+        """标签或小场景改变后：保存、刷新下拉框与统计；scene 为空表示可能影响所有场景。"""
+        self._save_config()
+        self._refresh_sub_combos()
+        self._update_stats()
+        if self.current_point and (scene is None or self.current_point[0] == scene):
+            self._show_point(self.current_point)
 
     def _scenes(self) -> list[str]:
         return list(dict.fromkeys(scene for scene, _ in self.groups))
@@ -433,10 +493,7 @@ class MainWindow(QMainWindow):
             self.config.scene_labels.pop(scene, None)
         else:
             self.config.scene_labels[scene] = label
-        self._save_config()
-        self._update_stats()
-        if self.current_point and self.current_point[0] == scene:
-            self._show_point(self.current_point)
+        self._after_labels_changed(scene)
 
     def _update_stats(self) -> None:
         n_parsed, n_unmatched = self._file_stats
@@ -451,6 +508,11 @@ class MainWindow(QMainWindow):
         )
         if unlabeled:
             text += f"，<span style='color:#b45309'>未标注 {unlabeled}</span>"
+        if self.config.sub_categories:
+            no_sub = sum(s not in self.config.scene_subs for s in scenes)
+            text += f"\n小场景：已标注 {len(scenes) - no_sub}"
+            if no_sub:
+                text += f"，<span style='color:#b45309'>未标注 {no_sub}</span>"
         self.stats_label.setText(text.replace("\n", "<br>"))
 
     def _populate_table(self) -> None:
@@ -641,6 +703,9 @@ class MainWindow(QMainWindow):
         self.car.set_coverage(coverage)
 
         title = [f"{point[0]} / 点位 {point[1]}", LABEL_TEXT.get(self.config.scene_labels.get(point[0]), "未标注")]
+        sub = self.config.scene_subs.get(point[0])
+        if sub is not None:
+            title.append(f"小场景 {sub} {self.config.sub_categories[sub]}")
         if frames:
             try:
                 tolerance = self.tolerance_spin.value()
@@ -703,20 +768,27 @@ class MainWindow(QMainWindow):
             if ok != QMessageBox.StandardButton.Yes:
                 return
 
-        scene_labels = None
+        scene_labels = scene_subs = None
         if self.combined_check.isChecked():
             scenes = self._scenes()
             scene_labels = {sc: self.config.scene_labels[sc] for sc in scenes if sc in self.config.scene_labels}
-            unlabeled = [sc for sc in scenes if sc not in scene_labels]
             if not scene_labels:
                 QMessageBox.warning(self, "提示", "生成总表需要先在左侧为场景选择标签（1 车内 / 0 车外）")
                 return
+            scene_subs = {
+                sc: (cid, self.config.sub_categories[cid])
+                for sc in scene_labels
+                if (cid := self.config.scene_subs.get(sc)) is not None
+            }
+            warnings = []
+            unlabeled = [sc for sc in scenes if sc not in scene_labels]
             if unlabeled:
-                ok = QMessageBox.question(
-                    self,
-                    "存在未标注的场景",
-                    f"{'、'.join(unlabeled)} 未标注，不会写入总表（单点位文件照常导出）。是否继续？",
-                )
+                warnings.append(f"{'、'.join(unlabeled)} 未标注车内/车外，不会写入总表（单点位文件照常导出）。")
+            no_sub = [sc for sc in scene_labels if sc not in scene_subs]
+            if scene_subs and no_sub:
+                warnings.append(f"{'、'.join(no_sub)} 未标注小场景，总表中这些场景的 sub_scene / sub_label 为空。")
+            if warnings:
+                ok = QMessageBox.question(self, "标注不完整", "\n\n".join(warnings) + "\n\n是否继续？")
                 if ok != QMessageBox.StandardButton.Yes:
                     return
 
@@ -753,7 +825,9 @@ class MainWindow(QMainWindow):
         # 信号都连接到主窗口的方法，保证回调在界面线程执行
         self._out_dir = out_dir
         self._thread = QThread(self)
-        self._worker = ExportWorker(self.groups, slave_to_anchor, anchor_order, out_dir, options, scene_labels)
+        self._worker = ExportWorker(
+            self.groups, slave_to_anchor, anchor_order, out_dir, options, scene_labels, scene_subs
+        )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.progress.connect(self._export_progress)

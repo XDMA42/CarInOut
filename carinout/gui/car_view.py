@@ -1,4 +1,4 @@
-"""车模俯视图：车头朝上，车外 8 个锚点（四角 + 十字），车内 2 个锚点。"""
+"""车模俯视图：车头朝上，车外 10 个锚点（四角 + 十字 + 左右后视镜），车内 2 个锚点。"""
 
 from __future__ import annotations
 
@@ -131,7 +131,7 @@ class CarView(QWidget):
     def _anchor_point(self, slot: AnchorSlot, car: QRectF) -> QPointF:
         x = car.left() + slot.x * car.width()
         y = car.top() + slot.y * car.height()
-        if not slot.inside and slot.x != 0.5 and slot.y != 0.5:
+        if slot.x in (0.0, 1.0) and slot.y in (0.0, 1.0):
             # 四角锚点落在圆角车身轮廓的 45° 处
             r_front, r_rear = self._corner_radii(car)
             k = (r_front if slot.y == 0 else r_rear) * (1 - 0.7071)
@@ -147,15 +147,16 @@ class CarView(QWidget):
         gap = self.MARKER_R + 8
         if slot.inside:
             return QRectF(marker.x() - w / 2, marker.y() + gap - 2, w, h)
-        if slot.x == 0:
+        # 位于车身左/右边缘或之外（后视镜）的锚点，标签放在外侧
+        if slot.x <= 0:
             x = marker.x() - gap - w
-        elif slot.x == 1:
+        elif slot.x >= 1:
             x = marker.x() + gap
         else:
             x = marker.x() - w / 2
-        if slot.y == 0:
+        if slot.y <= 0:
             y = marker.y() - gap - h
-        elif slot.y == 1:
+        elif slot.y >= 1:
             y = marker.y() + gap
         else:
             y = marker.y() - h / 2
@@ -345,13 +346,15 @@ class CarView(QWidget):
             p.drawText(QPointF(x + 18, y + fm.ascent()), text)
             x += 18 + fm.horizontalAdvance(text) + 18
 
+        # 窗口较窄时放不下就不画，避免和图例重叠（映射面板里也有同样的提示）
         hint = "单击锚点：定位映射  ·  双击锚点：重命名"
-        p.setPen(COLOR_MUTED)
-        p.drawText(
-            QRectF(16, self.height() - 16 - fm.height(), self.width() - 32, fm.height()),
-            Qt.AlignmentFlag.AlignRight,
-            hint,
-        )
+        if x + fm.horizontalAdvance(hint) <= self.width() - 16:
+            p.setPen(COLOR_MUTED)
+            p.drawText(
+                QRectF(16, self.height() - 16 - fm.height(), self.width() - 32, fm.height()),
+                Qt.AlignmentFlag.AlignRight,
+                hint,
+            )
 
     # ---- 交互 ----
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
