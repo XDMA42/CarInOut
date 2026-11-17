@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from .parser import unique_source_names
+
 TS_COLUMN = "ts"
 ERRCODE_COLUMN = "errcode"
 INPUT_ENCODINGS = ("utf-8-sig", "gb18030")
@@ -21,7 +23,9 @@ COMBINED_FILENAME = "_dataset.csv"
 JOIN_INNER = "inner"  # 只保留所有锚点都有数据的 ts
 JOIN_OUTER = "outer"  # 保留任一锚点出现过的 ts，缺数据的锚点补空
 
-# 总表中追加的列；label：0 = 车外，1 = 车内；sub_scene / sub_label：小场景类别名 / 编号
+# 总表中追加的列；source：来自哪个原始数据文件夹；label：0 = 车外，1 = 车内；
+# sub_scene / sub_label：小场景类别名 / 编号
+SOURCE_COLUMN = "source"
 SCENE_COLUMN = "scene"
 POINT_COLUMN = "point"
 LABEL_COLUMN = "label"
@@ -76,13 +80,26 @@ class PointResult:
     rows: int
     status: str
     anchors: dict[str, AnchorData] = field(default_factory=dict)
+    source: str = ""
 
 
-def dataset_folder(input_dir: Path, base: Path | None = None) -> Path:
-    """导出目录：base / 原始数据文件夹名；未指定 base 时为与原始数据文件夹同级的 merged 文件夹。"""
-    input_dir = input_dir.resolve()
-    base = base or input_dir.parent / "merged"
-    return base / (input_dir.name or "dataset")
+def default_dataset_name(sources: list[str]) -> str:
+    """数据集文件夹的默认名称：一个来源时就是它；两三个用 + 连接；更多时取第一个加“等 N 个”。"""
+    if not sources:
+        return "dataset"
+    if len(sources) <= 3:
+        return "+".join(sources)
+    return f"{sources[0]}等{len(sources)}个"
+
+
+def dataset_folder(input_dirs: list[Path], base: Path | None = None, name: str = "") -> Path:
+    """导出目录：base / 数据集名称。
+
+    未指定 base 时为与第一个原始数据文件夹同级的 merged 文件夹；
+    未指定名称时用 default_dataset_name（只有一个原始数据文件夹时就是该文件夹名）。
+    """
+    base = base or Path(input_dirs[0]).resolve().parent / "merged"
+    return base / (name.strip() or default_dataset_name(unique_source_names(input_dirs)))
 
 
 def find_column(df: pd.DataFrame, name: str) -> str | None:
@@ -267,9 +284,11 @@ def build_dataset(
 ) -> list[PointResult]:
     """对每个 (场景, 点位) 合并并写出 “场景_点位.csv”，最后写出 _summary.csv 汇总。
 
+    groups: (来源, 场景, 点位) → {SLAVE: [文件]}，见 parser.group_by_point。有多个来源时，
+            单点位文件按来源放在 out_dir 下的同名子文件夹中，总表和汇总仍各一个。
     slave_to_anchor: SLAVE 标识 → 锚点名；anchor_order: 输出列中锚点的先后顺序。
     scene_labels: 场景 → 标签（0 车外 / 1 车内）；不为 None 时另写出总表 _dataset.csv，
-                  只包含已标注场景，末尾追加 scene、point、label 三列。
+                  只包含已标注场景，末尾追加 source、scene、point、label 四列。
     scene_subs: 场景 → (小场景编号, 小场景名)；不为空时总表再追加 sub_scene、sub_label 两列，
                 未标注小场景的场景这两列留空。
     """
@@ -282,21 +301,28 @@ def build_dataset(
     results: list[PointResult] = []
     labeled_frames: list[pd.DataFrame] = []
     columns_by_anchor: dict[str, list[str]] = {name: [] for name in expected}
+    multi_source = len({source for source, _, _ in groups}) > 1
     total = len(groups)
-    for i, ((scene, point), slave_files) in enumerate(groups.items(), start=1):
+    for i, ((source, scene, point), slave_files) in enumerate(groups.items(), start=1):
         if cancelled and cancelled():
             log("已取消")
             break
+        point_dir = out_dir / source if multi_source else out_dir
+        point_dir.mkdir(exist_ok=True)
         result, merged = _merge_point(
-            scene, point, resolve_anchors(slave_files, slave_to_anchor), expected, out_dir, options
+            scene, point, resolve_anchors(slave_files, slave_to_anchor), expected, point_dir, options
         )
+        result.source = source
         results.append(result)
+        tag = f"{source}/{scene}_{point}" if multi_source else f"{scene}_{point}"
         for name, data in result.anchors.items():
             if data.error:
-                log(f"[{scene}_{point}] 锚点 {name} 读取失败：{data.error_file}: {data.error}")
-        log(f"[{scene}_{point}] {result.status}")
+                log(f"[{tag}] 锚点 {name} 读取失败：{data.error_file}: {data.error}")
+        log(f"[{tag}] {result.status}")
         if merged is not None and scene_labels is not None and scene in scene_labels:
-            extra = {SCENE_COLUMN: scene, POINT_COLUMN: point, LABEL_COLUMN: scene_labels[scene]}
+            extra = {
+                SOURCE_COLUMN: source, SCENE_COLUMN: scene, POINT_COLUMN: point, LABEL_COLUMN: scene_labels[scene],
+            }
             if scene_subs:
                 sub_id, sub_name = scene_subs.get(scene, ("", ""))
                 extra.update({SUB_SCENE_COLUMN: sub_name, SUB_LABEL_COLUMN: str(sub_id)})
@@ -313,7 +339,7 @@ def build_dataset(
         columns = (
             [TS_COLUMN]
             + [c for name in expected for c in columns_by_anchor[name]]
-            + [SCENE_COLUMN, POINT_COLUMN, LABEL_COLUMN]
+            + [SOURCE_COLUMN, SCENE_COLUMN, POINT_COLUMN, LABEL_COLUMN]
             + ([SUB_SCENE_COLUMN, SUB_LABEL_COLUMN] if scene_subs else [])
         )
         combined = (
@@ -322,8 +348,12 @@ def build_dataset(
             else pd.DataFrame(columns=columns)
         )
         combined.to_csv(out_dir / COMBINED_FILENAME, index=False, encoding=options.output_encoding)
+        n_sources = len({f[SOURCE_COLUMN].iat[0] for f in labeled_frames})
         n_scenes = len({f[SCENE_COLUMN].iat[0] for f in labeled_frames})
-        log(f"总表 {COMBINED_FILENAME}：{n_scenes} 个场景，{len(labeled_frames)} 个点位，共 {len(combined)} 行")
+        log(
+            f"总表 {COMBINED_FILENAME}：{n_sources} 个文件夹，{n_scenes} 个场景，"
+            f"{len(labeled_frames)} 个点位，共 {len(combined)} 行"
+        )
     return results
 
 
@@ -385,6 +415,7 @@ def _write_summary(
     rows = []
     for r in results:
         row = {
+            "来源": r.source,
             "场景": r.scene,
             "点位": r.point,
             "标签": (scene_labels or {}).get(r.scene, ""),

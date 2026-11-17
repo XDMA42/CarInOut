@@ -63,13 +63,22 @@ def validate_name(name: str, names: dict[str, str], key: str) -> str | None:
     return None
 
 
+def _input_dirs(data: dict) -> list[str]:
+    """上次的原始数据文件夹列表；兼容旧版本只保存一个文件夹的 last_input_dir。"""
+    dirs = data.get("last_input_dirs")
+    if isinstance(dirs, list):
+        return [d for d in dirs if isinstance(d, str) and d]
+    old = data.get("last_input_dir")
+    return [old] if isinstance(old, str) and old else []
+
+
 @dataclass
 class AppConfig:
     anchor_names: dict[str, str]
     # SLAVE 标识 → 锚点 key；未出现在字典中的 SLAVE 视为未分配
     slave_mapping: dict[str, str]
     filename_pattern: str
-    last_input_dir: str = ""
+    last_input_dirs: list[str] = field(default_factory=list)
     last_output_dir: str = ""
     # 场景 → 标签（0 车外 / 1 车内）；未出现的场景视为未标注
     scene_labels: dict[str, int] = field(default_factory=dict)
@@ -111,7 +120,7 @@ class AppConfig:
             anchor_names=names,
             slave_mapping=mapping,
             filename_pattern=pattern,
-            last_input_dir=data.get("last_input_dir", ""),
+            last_input_dirs=_input_dirs(data),
             last_output_dir=data.get("last_output_dir", ""),
             scene_labels={
                 scene: label
@@ -137,7 +146,7 @@ class AppConfig:
             "slave_mapping": self.slave_mapping,
             # 使用默认规则时不写入，以后默认规则更新能直接生效
             "filename_pattern": "" if self.filename_pattern == DEFAULT_PATTERN else self.filename_pattern,
-            "last_input_dir": self.last_input_dir,
+            "last_input_dirs": self.last_input_dirs,
             "last_output_dir": self.last_output_dir,
             "scene_labels": self.scene_labels,
             "sub_categories": {str(cid): name for cid, name in self.sub_categories.items()},

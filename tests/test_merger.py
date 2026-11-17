@@ -140,7 +140,8 @@ def test_combined_dataset_with_labels(folder: Path):
     df = read_out(out / COMBINED_FILENAME)
     # 第一个点位（座椅_53）没有 FL，FL 的列仍按锚点顺序排在最前
     assert list(df.columns) == [
-        "ts", "rssi_FL", "errcode_FL", "rssi_FR", "errcode_FR", "rssi_IF", "errcode_IF", "scene", "point", "label",
+        "ts", "rssi_FL", "errcode_FL", "rssi_FR", "errcode_FR", "rssi_IF", "errcode_IF",
+        "source", "scene", "point", "label",
     ]
     assert df.groupby("scene")["label"].unique().to_dict() == {"座椅": ["1"], "车外": ["0"]}
     assert len(df) == 4 + 1 + 2  # 座椅_53 + 座椅_54 + 车外_1
@@ -277,5 +278,46 @@ def test_dataset_folder_named_after_input(tmp_path: Path):
 
     raw = tmp_path / "data" / "1023采集"
     raw.mkdir(parents=True)
-    assert dataset_folder(raw) == tmp_path / "data" / "merged" / "1023采集"
-    assert dataset_folder(raw, tmp_path / "out") == tmp_path / "out" / "1023采集"
+    assert dataset_folder([raw]) == tmp_path / "data" / "merged" / "1023采集"
+    assert dataset_folder([raw], tmp_path / "out") == tmp_path / "out" / "1023采集"
+    other = tmp_path / "data" / "1024采集"
+    assert dataset_folder([raw, other]) == tmp_path / "data" / "merged" / "1023采集+1024采集"
+    assert dataset_folder([raw, other], name=" 全部 ") == tmp_path / "data" / "merged" / "全部"
+
+
+def test_default_dataset_name():
+    from carinout.merger import default_dataset_name
+
+    assert default_dataset_name(["a"]) == "a"
+    assert default_dataset_name(["a", "b", "c"]) == "a+b+c"
+    assert default_dataset_name(["a", "b", "c", "d"]) == "a等4个"
+
+
+def test_multiple_source_folders_build_one_dataset(tmp_path: Path):
+    from carinout.parser import scan_folders
+
+    raw = []
+    for day, rssi in (("1023采集", "-50"), ("1024采集", "-70")):
+        d = tmp_path / day
+        d.mkdir()
+        write(d / "座椅-1-[SLAVE1].csv", f"ts,rssi,errcode\n1,{rssi},0\n2,{rssi},0\n")
+        write(d / "座椅-1-[SLAVE2].csv", "ts,rssi,errcode\n1,-60,0\n2,-61,0\n")
+        raw.append(d)
+    write(raw[1] / "车外-3-[SLAVE1].csv", "ts,rssi,errcode\n5,-90,0\n")
+    parsed, _ = scan_folders(raw)
+    out = tmp_path / "out"
+    results = build_dataset(group_by_point(parsed), {"SLAVE1": "FL", "SLAVE2": "FR"}, ["FL", "FR"], out,
+                            MergeOptions(), scene_labels={"座椅": 1, "车外": 0})
+
+    # 单点位文件按来源放在子文件夹，场景点位相同的两批数据不会互相覆盖
+    assert read_out(out / "1023采集" / "座椅_1.csv")["rssi_FL"].tolist() == ["-50", "-50"]
+    assert read_out(out / "1024采集" / "座椅_1.csv")["rssi_FL"].tolist() == ["-70", "-70"]
+    assert (out / "1024采集" / "车外_3.csv").exists() and not (out / "座椅_1.csv").exists()
+    assert [r.source for r in results] == ["1023采集", "1024采集", "1024采集"]
+
+    df = read_out(out / COMBINED_FILENAME)
+    assert df.groupby(["source", "scene", "label"]).size().to_dict() == {
+        ("1023采集", "座椅", "1"): 2, ("1024采集", "座椅", "1"): 2, ("1024采集", "车外", "0"): 1,
+    }
+    summary = read_out(out / SUMMARY_FILENAME)
+    assert summary["来源"].tolist() == ["1023采集", "1024采集", "1024采集"]

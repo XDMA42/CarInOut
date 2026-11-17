@@ -45,8 +45,31 @@ def test_scan_and_group(tmp_path: Path):
     parsed, unmatched = scan_folder(tmp_path)
     assert [p.name for p in unmatched] == ["x.csv"]
     groups = group_by_point(parsed)
-    assert list(groups) == [("A", "2"), ("A", "10"), ("B", "1")]
-    assert list(groups[("A", "2")]) == ["SLAVE1", "SLAVE2", "SLAVE10"]
+    src = tmp_path.name  # 来源默认取文件夹名
+    assert list(groups) == [(src, "A", "2"), (src, "A", "10"), (src, "B", "1")]
+    assert list(groups[(src, "A", "2")]) == ["SLAVE1", "SLAVE2", "SLAVE10"]
+
+
+def test_scan_folders_keeps_same_point_from_different_folders_apart(tmp_path: Path):
+    from carinout.parser import scan_folders
+
+    for day in ("1023采集", "1024采集"):
+        (tmp_path / day).mkdir()
+        for name in ("座椅-1-[SLAVE1].csv", "座椅-1-[SLAVE2].csv"):
+            (tmp_path / day / name).write_text("ts,errcode\n1,0\n")
+    (tmp_path / "1024采集" / "notes.csv").write_text("a\n")
+    parsed, unmatched = scan_folders([tmp_path / "1023采集", tmp_path / "1024采集"])
+    assert [p.name for p in unmatched] == ["notes.csv"]
+    groups = group_by_point(parsed)
+    assert list(groups) == [("1023采集", "座椅", "1"), ("1024采集", "座椅", "1")]
+    assert all(list(v) == ["SLAVE1", "SLAVE2"] for v in groups.values())
+
+
+def test_unique_source_names(tmp_path: Path):
+    from carinout.parser import unique_source_names
+
+    dirs = [tmp_path / "a" / "raw", tmp_path / "b" / "raw", tmp_path / "1023采集", tmp_path / "c" / "a_raw"]
+    assert unique_source_names(dirs) == ["a_raw", "b_raw", "1023采集", "a_raw_2"]
 
 
 def test_legacy_default_pattern_in_config_is_upgraded(tmp_path: Path):

@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -48,11 +49,13 @@ from ..merger import (
     align_by_ts,
     build_dataset,
     dataset_folder,
+    default_dataset_name,
     load_anchor,
     unsynced_anchors,
 )
-from ..parser import DEFAULT_PATTERN, group_by_point, natural_key, scan_folder
+from ..parser import DEFAULT_PATTERN, group_by_point, natural_key, scan_folders, unique_source_names
 from .car_view import CarView, Coverage
+from .folder_list import FolderList, csv_subfolders
 from .sub_dialog import SubCategoryDialog, ask_new_sub_category
 
 ROLE_POINT = Qt.ItemDataRole.UserRole
@@ -99,16 +102,18 @@ class MainWindow(QMainWindow):
         self.resize(1480, 900)
 
         self.config = AppConfig.load()
-        self.groups: dict[tuple[str, str], dict[str, list[Path]]] = {}
+        # (来源, 场景, 点位) → {SLAVE: [文件]}；来源是原始数据文件夹的简称
+        self.groups: dict[tuple[str, str, str], dict[str, list[Path]]] = {}
         self.slaves: list[str] = []
-        self.current_point: tuple[str, str] | None = None
-        # 当前预览点位已读取的数据：(场景, 点位), {SLAVE: AnchorData}
-        self._point_cache: tuple[tuple[str, str], dict[str, AnchorData]] | None = None
+        self.current_point: tuple[str, str, str] | None = None
+        # 当前预览点位已读取的数据：(来源, 场景, 点位), {SLAVE: AnchorData}
+        self._point_cache: tuple[tuple[str, str, str], dict[str, AnchorData]] | None = None
         self._file_stats = (0, 0)  # (已识别, 未识别) 的 CSV 数
         self._thread: QThread | None = None
         self._worker: ExportWorker | None = None
         self._out_dir: Path | None = None
-        self._input_dir: Path | None = None  # 当前已解析的原始数据文件夹
+        self._input_dirs: list[Path] = []  # 当前已解析的原始数据文件夹
+        self._sources: list[str] = []  # 与 _input_dirs 一一对应的来源简称
         self._combos: dict[str, QComboBox] = {}
         self._sub_combos: dict[str, QComboBox] = {}  # 场景 → 小场景下拉框
 
@@ -128,7 +133,17 @@ class MainWindow(QMainWindow):
         top = QSplitter(Qt.Orientation.Horizontal)
         top.addWidget(left)
         top.addWidget(self.car)
-        top.addWidget(right)
+        # 右侧内容较多，屏幕较矮时滚动显示，避免控件被压扁重叠
+        right_scroll = QScrollArea()
+        right_scroll.setWidget(right)
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # 和不滚动时一样，分隔条不能把右侧压得比内容还窄
+        right_scroll.setMinimumWidth(right.minimumSizeHint().width() + right_scroll.verticalScrollBar().sizeHint().width())
+        self._right_panel = right
+        right.installEventFilter(self)  # 宽度变化时换行行数会变，重新计算所需高度
+        top.addWidget(right_scroll)
         top.setStretchFactor(1, 1)
         top.setSizes([470, 640, 370])
 
@@ -147,20 +162,28 @@ class MainWindow(QMainWindow):
         self._refresh_mapping_view()
         self._update_car_title()
         self._update_target_label()
-        if self.config.last_input_dir and Path(self.config.last_input_dir).is_dir():
-            self.input_edit.setText(self.config.last_input_dir)
-            self._parse_folder()
+        if self.folder_list.add_folders([Path(d) for d in self.config.last_input_dirs]) == 0:
+            self._update_stats()
 
     # ------------------------------------------------------------------ 界面搭建
     def _build_data_panel(self) -> QWidget:
         box = QGroupBox("数据文件")
-        self.input_edit = QLineEdit()
-        self.input_edit.setPlaceholderText("选择包含 CSV 的文件夹")
-        browse = QPushButton("浏览…")
-        browse.clicked.connect(self._choose_input)
+        self.folder_list = FolderList()
+        self.folder_list.setMaximumHeight(110)
+        self.folder_list.changed.connect(lambda: self._parse_folders(auto=True))
+        add_one = QPushButton("添加文件夹…")
+        add_one.clicked.connect(self._add_folder)
+        add_subs = QPushButton("添加子文件夹…")
+        add_subs.setToolTip("选择一个上级文件夹，把其中所有含 CSV 的子文件夹一次加入")
+        add_subs.clicked.connect(self._add_subfolders)
+        remove = QPushButton("移除")
+        remove.setToolTip("移除选中的文件夹（也可按 Delete 键）")
+        remove.clicked.connect(self.folder_list.remove_selected)
+        clear = QPushButton("清空")
+        clear.clicked.connect(self.folder_list.clear_all)
         row = QHBoxLayout()
-        row.addWidget(self.input_edit, 1)
-        row.addWidget(browse)
+        for b in (add_one, add_subs, remove, clear):
+            row.addWidget(b)
 
         self.pattern_edit = QLineEdit(self.config.filename_pattern)
         self.pattern_edit.setToolTip(
@@ -173,9 +196,8 @@ class MainWindow(QMainWindow):
         reset.clicked.connect(lambda: self.pattern_edit.setText(DEFAULT_PATTERN))
         parse = QPushButton("解析")
         parse.setDefault(True)
-        parse.clicked.connect(self._parse_folder)
-        self.pattern_edit.returnPressed.connect(self._parse_folder)
-        self.input_edit.returnPressed.connect(self._parse_folder)
+        parse.clicked.connect(self._parse_folders)
+        self.pattern_edit.returnPressed.connect(self._parse_folders)
         prow = QHBoxLayout()
         prow.addWidget(self.pattern_edit, 1)
         prow.addWidget(reset)
@@ -199,7 +221,8 @@ class MainWindow(QMainWindow):
         self.tree.currentItemChanged.connect(self._on_tree_selection)
 
         lay = QVBoxLayout(box)
-        lay.addWidget(QLabel("输入文件夹"))
+        lay.addWidget(QLabel("原始数据文件夹（可多个，同名场景共用标签，导出为一个数据集）"))
+        lay.addWidget(self.folder_list)
         lay.addLayout(row)
         lay.addWidget(QLabel("文件名规则（场景 / 点位 / 锚点）"))
         lay.addLayout(prow)
@@ -258,6 +281,9 @@ class MainWindow(QMainWindow):
         orow = QHBoxLayout()
         orow.addWidget(self.output_edit, 1)
         orow.addWidget(obrowse)
+        self.name_edit = QLineEdit()
+        self.name_edit.setToolTip("导出的文件夹名；留空时用原始数据文件夹名（多个时用 + 连接，超过 3 个取第一个加“等 N 个”）")
+        self.name_edit.textChanged.connect(self._update_target_label)
         self.target_label = QLabel()
         self.target_label.setWordWrap(True)
         self.target_label.setStyleSheet("color: gray")
@@ -298,20 +324,22 @@ class MainWindow(QMainWindow):
 
         self.export_btn = QPushButton("开始合并导出")
         self.export_btn.setMinimumHeight(34)
+        self.export_btn.setToolTip("输出：场景_点位.csv，首列 ts，其余列名 = 原列名_锚点名，仅保留 errcode=0 的行")
         self.export_btn.clicked.connect(self._export_or_cancel)
         self.progress = QProgressBar()
         self.progress.setValue(0)
 
         elay = QVBoxLayout(ebox)
-        elay.addWidget(QLabel("输出位置（会在其中建立与原始数据文件夹同名的文件夹）"))
+        elay.addWidget(QLabel("输出位置"))
         elay.addLayout(orow)
+        nrow = QHBoxLayout()
+        nrow.addWidget(QLabel("数据集名称"))
+        nrow.addWidget(self.name_edit, 1)
+        elay.addLayout(nrow)
         elay.addWidget(self.target_label)
         elay.addLayout(form)
         elay.addWidget(self.complete_check)
         elay.addWidget(self.combined_check)
-        note = QLabel("输出：场景_点位.csv，首列 ts，其余列名 = 原列名_锚点名，仅保留 errcode=0 的行")
-        note.setWordWrap(True)
-        elay.addWidget(note)
         elay.addWidget(self.export_btn)
         elay.addWidget(self.progress)
 
@@ -320,41 +348,79 @@ class MainWindow(QMainWindow):
         return panel
 
     # ------------------------------------------------------------------ 数据加载
-    def _choose_input(self) -> None:
-        start = self.input_edit.text() or self.config.last_input_dir
-        folder = QFileDialog.getExistingDirectory(self, "选择 CSV 所在文件夹", start)
-        if folder:
-            self.input_edit.setText(folder)
-            self._parse_folder()
+    def _last_folder(self) -> str:
+        folders = self.folder_list.folders()
+        return str(folders[-1]) if folders else ""
+
+    def _add_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "添加原始数据文件夹", self._last_folder())
+        if folder and not self.folder_list.add_folders([Path(folder)]):
+            self.statusBar().showMessage("该文件夹已在列表中", 5000)
+
+    def _add_subfolders(self) -> None:
+        start = str(Path(self._last_folder()).parent) if self._last_folder() else ""
+        folder = QFileDialog.getExistingDirectory(self, "选择上级文件夹（加入其中所有含 CSV 的子文件夹）", start)
+        if not folder:
+            return
+        subdirs = csv_subfolders(Path(folder))
+        if not subdirs:
+            QMessageBox.information(self, "提示", f"{folder}\n下没有直接包含 CSV 的子文件夹")
+            return
+        added = self.folder_list.add_folders(subdirs)
+        self.statusBar().showMessage(f"找到 {len(subdirs)} 个子文件夹，新加入 {added} 个", 5000)
 
     def _choose_output(self) -> None:
-        start = self.output_edit.text() or self.input_edit.text()
+        start = self.output_edit.text() or self._last_folder()
         folder = QFileDialog.getExistingDirectory(self, "选择输出文件夹", start)
         if folder:
             self.output_edit.setText(folder)
 
     def _target_dir(self) -> Path:
-        """实际导出目录：输出位置 / 原始数据文件夹名。"""
+        """实际导出目录：输出位置 / 数据集名称（默认由原始数据文件夹名组成）。"""
         out_text = self.output_edit.text().strip()
-        return dataset_folder(self._input_dir, Path(out_text) if out_text else None)
+        return dataset_folder(self._input_dirs, Path(out_text) if out_text else None, self.name_edit.text())
 
     def _update_target_label(self) -> None:
-        if self._input_dir is None:
+        self.name_edit.setPlaceholderText(f"默认：{default_dataset_name(self._sources)}" if self._sources else "")
+        if not self._input_dirs:
             self.target_label.setText("解析数据后显示导出路径")
+            self._fit_right_panel()
             return
         target = str(self._target_dir())
         # 在路径分隔符后插入零宽空格，长路径可以换行显示
         self.target_label.setText("将导出到：" + target.replace("/", "/\u200b").replace("\\", "\\\u200b"))
-        self.target_label.setToolTip(target)
+        tip = target
+        if len(self._sources) > 1:
+            tip += "\n总表 _dataset.csv 和 _summary.csv 各一个；单点位文件按原始文件夹放在同名子文件夹中"
+        self.target_label.setToolTip(tip)
+        self._fit_right_panel()
 
-    def _parse_folder(self) -> None:
-        folder = Path(self.input_edit.text().strip())
-        if not self.input_edit.text().strip() or not folder.is_dir():
-            QMessageBox.warning(self, "提示", "请先选择有效的输入文件夹")
+    def _fit_right_panel(self) -> None:
+        """右侧面板最矮不低于内容所需高度，放不下时由外层滚动区域滚动，而不是把控件压扁。"""
+        panel = getattr(self, "_right_panel", None)
+        if panel is None:
+            return
+        layout = panel.layout()
+        height = layout.sizeHint().height()
+        if layout.hasHeightForWidth():  # 自动换行的标签：按当前宽度算实际需要的行数
+            height = max(height, layout.totalHeightForWidth(panel.width()))
+        if height != panel.minimumHeight():
+            panel.setMinimumHeight(height)
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if obj is getattr(self, "_right_panel", None) and event.type() == QEvent.Type.Resize:
+            self._fit_right_panel()
+        return super().eventFilter(obj, event)
+
+    def _parse_folders(self, auto: bool = False) -> None:
+        """解析列表中的所有原始数据文件夹；auto 为 True 表示由列表变化触发，空列表时不弹提示。"""
+        folders = [f for f in self.folder_list.folders() if f.is_dir()]
+        if not folders and not auto:
+            QMessageBox.warning(self, "提示", "请先添加原始数据文件夹")
             return
         pattern = self.pattern_edit.text().strip() or DEFAULT_PATTERN
         try:
-            parsed, unmatched = scan_folder(folder, pattern)
+            parsed, unmatched = scan_folders(folders, pattern)
         except ValueError as exc:
             QMessageBox.warning(self, "文件名规则错误", str(exc))
             return
@@ -363,9 +429,10 @@ class MainWindow(QMainWindow):
             return
 
         self.config.filename_pattern = pattern
-        self.config.last_input_dir = str(folder)
+        self.config.last_input_dirs = [str(f) for f in folders]
         self._save_config()
-        self._input_dir = folder
+        self._input_dirs = folders
+        self._sources = unique_source_names(folders)
         self._update_target_label()
 
         self.groups = group_by_point(parsed)
@@ -373,8 +440,9 @@ class MainWindow(QMainWindow):
         self._point_cache = None
         self.current_point = None
 
-        self._log(f"解析文件夹：{folder}")
-        self._log(f"  识别 {len(parsed)} 个 CSV，未识别 {len(unmatched)} 个")
+        if folders:
+            self._log(f"解析 {len(folders)} 个文件夹：" + "、".join(str(f) for f in folders))
+            self._log(f"  识别 {len(parsed)} 个 CSV，未识别 {len(unmatched)} 个")
         for path in unmatched[:20]:
             self._log(f"  未识别：{path.name}")
         if len(unmatched) > 20:
@@ -392,18 +460,28 @@ class MainWindow(QMainWindow):
         self.car.set_coverage(None)
         self._update_car_title()
 
+    def _point_tag(self, key: tuple[str, str, str]) -> str:
+        source, scene, point = key
+        return f"{source}/{scene}_{point}" if len(self._sources) > 1 else f"{scene}_{point}"
+
     def _log_duplicates(self) -> None:
-        for (scene, point), slave_files in self.groups.items():
+        for key, slave_files in self.groups.items():
             for slave, paths in slave_files.items():
                 if len(paths) > 1:
                     names = "、".join(p.name for p in paths)
-                    self._log(f"  [{scene}_{point}] {slave} 有 {len(paths)} 个文件，将按顺序纵向拼接：{names}")
+                    self._log(f"  [{self._point_tag(key)}] {slave} 有 {len(paths)} 个文件，将按顺序纵向拼接：{names}")
 
     def _populate_tree(self) -> None:
         self.tree.clear()
         total = len(self.slaves)
+        multi = len(self._sources) > 1
         scene_items: dict[str, QTreeWidgetItem] = {}
-        for (scene, point), slave_files in self.groups.items():
+        source_items: dict[tuple[str, str], QTreeWidgetItem] = {}  # 多个来源时：场景 → 来源 → 点位
+        n_points: dict[QTreeWidgetItem, int] = {}
+        # 按场景归组，同名场景的不同来源排在一起，标签只需在场景行标一次
+        for key in sorted(self.groups, key=lambda k: (natural_key(k[1]), natural_key(k[0]), natural_key(k[2]))):
+            source, scene, point = key
+            slave_files = self.groups[key]
             parent = scene_items.get(scene)
             if parent is None:
                 parent = QTreeWidgetItem([scene, "", ""])
@@ -412,9 +490,19 @@ class MainWindow(QMainWindow):
                 parent.setFont(0, font)
                 scene_items[scene] = parent
                 self.tree.addTopLevelItem(parent)
+            container = parent
+            if multi:
+                container = source_items.get((scene, source))
+                if container is None:
+                    container = QTreeWidgetItem([source, "", ""])
+                    container.setForeground(0, QColor(110, 110, 110))
+                    source_items[(scene, source)] = container
+                    parent.addChild(container)
+                n_points[container] = n_points.get(container, 0) + 1
+            n_points[parent] = n_points.get(parent, 0) + 1
             n_files = sum(len(v) for v in slave_files.values())
             item = QTreeWidgetItem([point, f"{len(slave_files)}/{total}", str(n_files)])
-            item.setData(0, ROLE_POINT, (scene, point))
+            item.setData(0, ROLE_POINT, key)
             item.setTextAlignment(1, Qt.AlignmentFlag.AlignCenter)
             item.setTextAlignment(2, Qt.AlignmentFlag.AlignCenter)
             missing = [s for s in self.slaves if s not in slave_files]
@@ -422,9 +510,11 @@ class MainWindow(QMainWindow):
                 for col in range(3):
                     item.setBackground(col, WARN_BG)
                 item.setToolTip(0, "缺少：" + "、".join(missing))
-            parent.addChild(item)
+            container.addChild(item)
+        for item in (*scene_items.values(), *source_items.values()):
+            item.setText(2, f"{n_points[item]} 个点位")
+        # 标签和小场景下拉框只放在场景行
         for scene, item in scene_items.items():
-            item.setText(2, f"{item.childCount()} 个点位")
             combo = QComboBox()
             combo.addItem("未标注", None)
             for label, text in LABEL_TEXT.items():
@@ -481,11 +571,11 @@ class MainWindow(QMainWindow):
         self._save_config()
         self._refresh_sub_combos()
         self._update_stats()
-        if self.current_point and (scene is None or self.current_point[0] == scene):
+        if self.current_point and (scene is None or self.current_point[1] == scene):
             self._show_point(self.current_point)
 
     def _scenes(self) -> list[str]:
-        return list(dict.fromkeys(scene for scene, _ in self.groups))
+        return sorted({scene for _, scene, _ in self.groups}, key=natural_key)
 
     def _on_label_changed(self, scene: str, combo: QComboBox) -> None:
         label = combo.currentData()
@@ -496,13 +586,16 @@ class MainWindow(QMainWindow):
         self._after_labels_changed(scene)
 
     def _update_stats(self) -> None:
+        if not self._input_dirs:
+            self.stats_label.setText("尚未加载数据")
+            return
         n_parsed, n_unmatched = self._file_stats
         scenes = self._scenes()
         inside = sum(self.config.scene_labels.get(s) == LABEL_INSIDE for s in scenes)
         outside = sum(self.config.scene_labels.get(s) == LABEL_OUTSIDE for s in scenes)
         unlabeled = len(scenes) - inside - outside
         text = (
-            f"CSV {n_parsed + n_unmatched} 个：已识别 {n_parsed}，未识别 {n_unmatched}\n"
+            f"文件夹 {len(self._input_dirs)} 个，CSV {n_parsed + n_unmatched} 个：已识别 {n_parsed}，未识别 {n_unmatched}\n"
             f"场景 {len(scenes)} 个，点位 {len(self.groups)} 个，SLAVE {len(self.slaves)} 个\n"
             f"标签：车内 {inside}，车外 {outside}"
         )
@@ -521,6 +614,7 @@ class MainWindow(QMainWindow):
             for slave, paths in slave_files.items():
                 counts[slave] += len(paths)
 
+        self.table.setRowCount(0)  # 先清空：替换下来的旧下拉框会立即隐藏，不会残留在表格上
         self.table.setRowCount(len(self.slaves))
         self._combos.clear()
         for row, slave in enumerate(self.slaves):
@@ -677,7 +771,7 @@ class MainWindow(QMainWindow):
         if self.current_point:
             self._show_point(self.current_point)
 
-    def _show_point(self, point: tuple[str, str]) -> None:
+    def _show_point(self, point: tuple[str, str, str]) -> None:
         if self._point_cache is None or self._point_cache[0] != point:
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             try:
@@ -702,8 +796,12 @@ class MainWindow(QMainWindow):
                     frames.append((self.config.anchor_names[key], data.valid))
         self.car.set_coverage(coverage)
 
-        title = [f"{point[0]} / 点位 {point[1]}", LABEL_TEXT.get(self.config.scene_labels.get(point[0]), "未标注")]
-        sub = self.config.scene_subs.get(point[0])
+        source, scene, pt = point
+        title = [f"{scene} / 点位 {pt}"]
+        if len(self._sources) > 1:
+            title.append(source)
+        title.append(LABEL_TEXT.get(self.config.scene_labels.get(scene), "未标注"))
+        sub = self.config.scene_subs.get(scene)
         if sub is not None:
             title.append(f"小场景 {sub} {self.config.sub_categories[sub]}")
         if frames:
@@ -726,7 +824,7 @@ class MainWindow(QMainWindow):
             title.append(f"⚠ 导出时会跳过：{','.join(lacking)} 缺失或无有效数据")
         self._update_car_title("  ·  ".join(title))
 
-        lines = [f"[{point[0]}_{point[1]}]"]
+        lines = [f"[{self._point_tag(point)}]"]
         for slave, data in loaded.items():
             key = self.config.slave_mapping.get(slave)
             target = self.config.anchor_names[key] if key else "未分配"

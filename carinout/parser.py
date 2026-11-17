@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,6 +31,7 @@ class ParsedFile:
     scene: str
     point: str
     slave: str
+    source: str = ""  # 来自哪个原始数据文件夹（文件夹名，多个同名时加以区分）
 
 
 def compile_pattern(pattern: str) -> re.Pattern[str]:
@@ -56,9 +57,29 @@ def parse_filename(name: str, regex: re.Pattern[str]) -> tuple[str, str, str] | 
     return scene, point, anchor.upper()
 
 
-def scan_folder(folder: Path, pattern: str = DEFAULT_PATTERN) -> tuple[list[ParsedFile], list[Path]]:
-    """扫描文件夹（不递归）中的 csv，返回 (解析成功的文件, 无法解析的 csv)。"""
+def unique_source_names(folders: list[Path]) -> list[str]:
+    """各原始数据文件夹的简称：默认取文件夹名；重名时加上上级文件夹名，仍重名再加序号。"""
+    paths = [Path(f).resolve() for f in folders]
+    names = [p.name or "dataset" for p in paths]
+    counts = Counter(names)
+    names = [f"{p.parent.name}_{n}" if counts[n] > 1 and p.parent.name else n for p, n in zip(paths, names)]
+    seen: Counter[str] = Counter()
+    result = []
+    for n in names:
+        seen[n] += 1
+        result.append(n if seen[n] == 1 else f"{n}_{seen[n]}")
+    return result
+
+
+def scan_folder(
+    folder: Path, pattern: str = DEFAULT_PATTERN, source: str | None = None
+) -> tuple[list[ParsedFile], list[Path]]:
+    """扫描文件夹（不递归）中的 csv，返回 (解析成功的文件, 无法解析的 csv)。
+
+    source 为这些文件的来源简称，默认取文件夹名。
+    """
     regex = compile_pattern(pattern)
+    source = source if source is not None else unique_source_names([folder])[0]
     parsed: list[ParsedFile] = []
     unmatched: list[Path] = []
     for path in sorted(folder.iterdir(), key=lambda p: natural_key(p.name)):
@@ -68,18 +89,32 @@ def scan_folder(folder: Path, pattern: str = DEFAULT_PATTERN) -> tuple[list[Pars
         if result is None:
             unmatched.append(path)
         else:
-            parsed.append(ParsedFile(path, *result))
+            parsed.append(ParsedFile(path, *result, source=source))
     return parsed, unmatched
 
 
-def group_by_point(files: list[ParsedFile]) -> dict[tuple[str, str], dict[str, list[Path]]]:
-    """(场景, 点位) → {SLAVE: [文件...]}，按自然顺序排序。"""
-    groups: dict[tuple[str, str], dict[str, list[Path]]] = defaultdict(lambda: defaultdict(list))
+def scan_folders(folders: list[Path], pattern: str = DEFAULT_PATTERN) -> tuple[list[ParsedFile], list[Path]]:
+    """依次扫描多个原始数据文件夹，来源简称见 unique_source_names。"""
+    parsed: list[ParsedFile] = []
+    unmatched: list[Path] = []
+    for folder, source in zip(folders, unique_source_names(folders)):
+        p, u = scan_folder(folder, pattern, source)
+        parsed += p
+        unmatched += u
+    return parsed, unmatched
+
+
+def group_by_point(files: list[ParsedFile]) -> dict[tuple[str, str, str], dict[str, list[Path]]]:
+    """(来源, 场景, 点位) → {SLAVE: [文件...]}，按自然顺序排序。
+
+    不同文件夹中场景、点位相同的数据是不同批次的采集，分开合并。
+    """
+    groups: dict[tuple[str, str, str], dict[str, list[Path]]] = defaultdict(lambda: defaultdict(list))
     for f in files:
-        groups[(f.scene, f.point)][f.slave].append(f.path)
+        groups[(f.source, f.scene, f.point)][f.slave].append(f.path)
     return {
         key: {slave: groups[key][slave] for slave in sorted(groups[key], key=natural_key)}
-        for key in sorted(groups, key=lambda k: (natural_key(k[0]), natural_key(k[1])))
+        for key in sorted(groups, key=lambda k: tuple(natural_key(part) for part in k))
     }
 
 
