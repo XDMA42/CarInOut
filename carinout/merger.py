@@ -23,14 +23,11 @@ COMBINED_FILENAME = "_dataset.csv"
 JOIN_INNER = "inner"  # 只保留所有锚点都有数据的 ts
 JOIN_OUTER = "outer"  # 保留任一锚点出现过的 ts，缺数据的锚点补空
 
-# 总表中追加的列；source：来自哪个原始数据文件夹；label：0 = 车外，1 = 车内；
-# sub_scene / sub_label：小场景类别名 / 编号
+# 总表中追加的列；source：来自哪个原始数据文件夹；label：0 = 车外，1 = 车内
 SOURCE_COLUMN = "source"
 SCENE_COLUMN = "scene"
 POINT_COLUMN = "point"
 LABEL_COLUMN = "label"
-SUB_SCENE_COLUMN = "sub_scene"
-SUB_LABEL_COLUMN = "sub_label"
 LABEL_OUTSIDE = 0
 LABEL_INSIDE = 1
 
@@ -277,7 +274,7 @@ def build_dataset(
     out_dir: Path,
     options: MergeOptions | None = None,
     scene_labels: dict[str, int] | None = None,
-    scene_subs: dict[str, tuple[int, str]] | None = None,
+    point_labels: dict[tuple[str, str], int] | None = None,
     progress: Callable[[int, int], None] | None = None,
     log: Callable[[str], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
@@ -288,10 +285,10 @@ def build_dataset(
             单点位文件按来源放在 out_dir 下的同名子文件夹中，总表和汇总仍各一个。
     slave_to_anchor: SLAVE 标识 → 锚点名；anchor_order: 输出列中锚点的先后顺序。
     scene_labels: 场景 → 标签（0 车外 / 1 车内）；不为 None 时另写出总表 _dataset.csv，
-                  只包含已标注场景，末尾追加 source、scene、point、label 四列。
-    scene_subs: 场景 → (小场景编号, 小场景名)；不为空时总表再追加 sub_scene、sub_label 两列，
-                未标注小场景的场景这两列留空。
+                  只包含有标签的点位，末尾追加 source、scene、point、label 四列。
+    point_labels: (场景, 点位) → 标签，单独设置的点位标签，优先于场景标签。
     """
+    point_labels = point_labels or {}
     options = options or MergeOptions()
     log = log or (lambda _msg: None)
     check_mapping(slave_to_anchor)
@@ -319,14 +316,11 @@ def build_dataset(
             if data.error:
                 log(f"[{tag}] 锚点 {name} 读取失败：{data.error_file}: {data.error}")
         log(f"[{tag}] {result.status}")
-        if merged is not None and scene_labels is not None and scene in scene_labels:
-            extra = {
-                SOURCE_COLUMN: source, SCENE_COLUMN: scene, POINT_COLUMN: point, LABEL_COLUMN: scene_labels[scene],
-            }
-            if scene_subs:
-                sub_id, sub_name = scene_subs.get(scene, ("", ""))
-                extra.update({SUB_SCENE_COLUMN: sub_name, SUB_LABEL_COLUMN: str(sub_id)})
-            labeled_frames.append(merged.assign(**extra))
+        label = _point_label(scene, point, scene_labels, point_labels)
+        if merged is not None and scene_labels is not None and label is not None:
+            labeled_frames.append(
+                merged.assign(**{SOURCE_COLUMN: source, SCENE_COLUMN: scene, POINT_COLUMN: point, LABEL_COLUMN: label})
+            )
             for name, data in result.anchors.items():
                 if data.valid is not None:
                     seen = columns_by_anchor[name]
@@ -334,13 +328,12 @@ def build_dataset(
         if progress:
             progress(i, total)
 
-    _write_summary(results, expected, scene_labels, scene_subs, out_dir / SUMMARY_FILENAME, options.output_encoding)
+    _write_summary(results, expected, scene_labels, point_labels, out_dir / SUMMARY_FILENAME, options.output_encoding)
     if scene_labels is not None:
         columns = (
             [TS_COLUMN]
             + [c for name in expected for c in columns_by_anchor[name]]
             + [SOURCE_COLUMN, SCENE_COLUMN, POINT_COLUMN, LABEL_COLUMN]
-            + ([SUB_SCENE_COLUMN, SUB_LABEL_COLUMN] if scene_subs else [])
         )
         combined = (
             pd.concat(labeled_frames, ignore_index=True).reindex(columns=columns)
@@ -408,7 +401,7 @@ def _write_summary(
     results: list[PointResult],
     anchor_order: list[str],
     scene_labels: dict[str, int] | None,
-    scene_subs: dict[str, tuple[int, str]] | None,
+    point_labels: dict[tuple[str, str], int],
     path: Path,
     encoding: str,
 ) -> None:
@@ -418,8 +411,8 @@ def _write_summary(
             "来源": r.source,
             "场景": r.scene,
             "点位": r.point,
-            "标签": (scene_labels or {}).get(r.scene, ""),
-            "小场景": " ".join(map(str, (scene_subs or {}).get(r.scene, ()))),
+            "标签": _point_label(r.scene, r.point, scene_labels, point_labels),
+            "标签来源": "点位" if (r.scene, r.point) in point_labels else ("场景" if r.scene in (scene_labels or {}) else ""),
             "输出文件": r.output.name if r.output else "",
             "输出行数": r.rows,
             "状态": r.status,
@@ -430,3 +423,11 @@ def _write_summary(
             row[f"{name}_原始行"] = data.total_rows if data else ""
         rows.append(row)
     pd.DataFrame(rows).to_csv(path, index=False, encoding=encoding)
+
+
+def _point_label(
+    scene: str, point: str, scene_labels: dict[str, int] | None, point_labels: dict[tuple[str, str], int]
+) -> int | None:
+    """点位的实际标签：单独设置过的优先，否则跟随场景；都没有时为 None。"""
+    label = point_labels.get((scene, point))
+    return label if label is not None else (scene_labels or {}).get(scene)

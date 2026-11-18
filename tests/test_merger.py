@@ -151,27 +151,6 @@ def test_combined_dataset_with_labels(folder: Path):
     assert summary.set_index("场景")["标签"].to_dict() == {"座椅": "1", "车外": "0"}
 
 
-def test_combined_dataset_with_sub_scenes(folder: Path):
-    parsed, _ = scan_folder(folder)
-    out = folder.parent / "out"
-    build_dataset(
-        group_by_point(parsed), {"SLAVE1": "FL", "SLAVE2": "FR"}, ["FL", "FR"], out, MergeOptions(),
-        scene_labels={"座椅": 1, "车外": 0}, scene_subs={"座椅": (2, "中排")},
-    )
-    df = read_out(out / COMBINED_FILENAME)
-    assert list(df.columns)[-5:] == ["scene", "point", "label", "sub_scene", "sub_label"]
-    seat, outside = df[df["scene"] == "座椅"], df[df["scene"] == "车外"]
-    assert set(seat["sub_scene"]) == {"中排"} and set(seat["sub_label"]) == {"2"}
-    assert set(outside["sub_scene"]) == {""} and set(outside["sub_label"]) == {""}  # 未标注小场景留空
-    summary = read_out(out / SUMMARY_FILENAME)
-    assert summary.set_index("场景")["小场景"].to_dict() == {"座椅": "2 中排", "车外": ""}
-
-
-def test_no_sub_columns_without_sub_scenes(folder: Path):
-    out, _ = run(folder, {"SLAVE1": "FL", "SLAVE2": "FR"}, labels={"座椅": 1})
-    assert list(read_out(out / COMBINED_FILENAME).columns)[-1] == "label"
-
-
 def test_combined_dataset_skips_unlabeled_scenes(folder: Path):
     out, _ = run(folder, {"SLAVE1": "FL", "SLAVE2": "FR"}, labels={"座椅": 1})
     df = read_out(out / COMBINED_FILENAME)
@@ -321,3 +300,27 @@ def test_multiple_source_folders_build_one_dataset(tmp_path: Path):
     }
     summary = read_out(out / SUMMARY_FILENAME)
     assert summary["来源"].tolist() == ["1023采集", "1024采集", "1024采集"]
+
+
+def test_point_labels_override_scene_labels_in_outputs(folder: Path):
+    parsed, _ = scan_folder(folder)
+    out = folder.parent / "out"
+    build_dataset(
+        group_by_point(parsed), {"SLAVE1": "FL", "SLAVE2": "FR"}, ["FL", "FR"], out, MergeOptions(),
+        # 座椅 整体是车内，其中点位 54 单独设为车外；车外 场景未标注，但点位 1 单独标了车外
+        scene_labels={"座椅": 1}, point_labels={("座椅", "54"): 0, ("车外", "1"): 0},
+    )
+    df = read_out(out / COMBINED_FILENAME)
+    assert list(df.columns)[-4:] == ["source", "scene", "point", "label"]
+    assert df.groupby(["scene", "point"])["label"].unique().to_dict() == {
+        ("座椅", "53"): ["1"], ("座椅", "54"): ["0"], ("车外", "1"): ["0"],
+    }
+    summary = read_out(out / SUMMARY_FILENAME).set_index(["场景", "点位"])
+    assert summary["标签"].to_dict() == {("座椅", "53"): "1", ("座椅", "54"): "0", ("车外", "1"): "0"}
+    assert summary["标签来源"].to_dict() == {("座椅", "53"): "场景", ("座椅", "54"): "点位", ("车外", "1"): "点位"}
+
+
+def test_points_without_any_label_left_out_of_total(folder: Path):
+    out, _ = run(folder, {"SLAVE1": "FL", "SLAVE2": "FR"}, labels={"座椅": 1})
+    assert set(read_out(out / COMBINED_FILENAME)["scene"]) == {"座椅"}
+    assert read_out(out / SUMMARY_FILENAME).set_index("场景")["标签"].to_dict()["车外"] == ""

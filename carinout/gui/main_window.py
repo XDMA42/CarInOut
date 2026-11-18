@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
@@ -56,11 +57,12 @@ from ..merger import (
 from ..parser import DEFAULT_PATTERN, group_by_point, natural_key, scan_folders, unique_source_names
 from .car_view import CarView, Coverage
 from .folder_list import FolderList, csv_subfolders
-from .sub_dialog import SubCategoryDialog, ask_new_sub_category
 
 ROLE_POINT = Qt.ItemDataRole.UserRole
 LABEL_TEXT = {LABEL_INSIDE: "1 车内", LABEL_OUTSIDE: "0 车外"}
-NEW_SUB = -1  # 小场景下拉框中“新建类别…”选项的数据
+FOLLOW_SCENE = "follow"  # 点位标签菜单中“跟随场景”选项的数据
+LABEL_COLOR_OVERRIDE = QColor("#2563eb")
+LABEL_COLOR_INHERIT = QColor(128, 128, 128)
 WARN_BG = QColor(245, 158, 11, 60)
 ERROR_BG = QColor(220, 38, 38, 70)
 
@@ -72,10 +74,10 @@ class ExportWorker(QObject):
     failed = Signal(str)
 
     def __init__(
-        self, groups, slave_to_anchor, anchor_order, out_dir: Path, options: MergeOptions, scene_labels, scene_subs
+        self, groups, slave_to_anchor, anchor_order, out_dir: Path, options: MergeOptions, scene_labels, point_labels
     ) -> None:
         super().__init__()
-        self._args = (groups, slave_to_anchor, anchor_order, out_dir, options, scene_labels, scene_subs)
+        self._args = (groups, slave_to_anchor, anchor_order, out_dir, options, scene_labels, point_labels)
         self._cancel = False
 
     def cancel(self) -> None:
@@ -115,7 +117,7 @@ class MainWindow(QMainWindow):
         self._input_dirs: list[Path] = []  # 当前已解析的原始数据文件夹
         self._sources: list[str] = []  # 与 _input_dirs 一一对应的来源简称
         self._combos: dict[str, QComboBox] = {}
-        self._sub_combos: dict[str, QComboBox] = {}  # 场景 → 小场景下拉框
+        self._point_items: dict[tuple[str, str, str], QTreeWidgetItem] = {}  # (来源, 场景, 点位) → 树中的点位行
 
         self.car = CarView()
         self.car.set_names(self.config.anchor_names)
@@ -207,18 +209,23 @@ class MainWindow(QMainWindow):
         self.stats_label.setWordWrap(True)
 
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["场景 / 点位", "SLAVE", "文件", "标签", "小场景"])
-        self.tree.headerItem().setToolTip(3, "为每个场景选择类别：1 = 车内，0 = 车外（写入总表的 label 列）")
-        self.tree.headerItem().setToolTip(4, "为每个场景选择小场景类别（写入总表的 sub_scene / sub_label 列）")
-        manage_subs = QPushButton("管理小场景类别…")
-        manage_subs.clicked.connect(self._manage_sub_categories)
-        srow = QHBoxLayout()
-        srow.addWidget(self.stats_label, 1)
-        srow.addWidget(manage_subs, 0, Qt.AlignmentFlag.AlignBottom)
+        self.tree.setHeaderLabels(["场景 / 点位", "SLAVE", "文件", "标签"])
+        self.tree.headerItem().setToolTip(
+            3,
+            "场景行：该场景所有点位的默认标签（1 = 车内，0 = 车外）。\n"
+            "点位行：默认跟随场景（灰色）；点击可单独设置（蓝色加粗），多选后右键可批量设置。",
+        )
         self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.tree.header().setStretchLastSection(False)
         self.tree.setUniformRowHeights(True)
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.tree.currentItemChanged.connect(self._on_tree_selection)
+        self.tree.itemClicked.connect(self._on_tree_clicked)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._on_tree_context_menu)
+        tree_hint = QLabel("点位的标签默认跟随场景；点击点位的“标签”可单独修改，按住 Ctrl/Shift 多选后右键可批量修改")
+        tree_hint.setWordWrap(True)
+        tree_hint.setStyleSheet("color: gray")
 
         lay = QVBoxLayout(box)
         lay.addWidget(QLabel("原始数据文件夹（可多个，同名场景共用标签，导出为一个数据集）"))
@@ -226,8 +233,9 @@ class MainWindow(QMainWindow):
         lay.addLayout(row)
         lay.addWidget(QLabel("文件名规则（场景 / 点位 / 锚点）"))
         lay.addLayout(prow)
-        lay.addLayout(srow)
+        lay.addWidget(self.stats_label)
         lay.addWidget(self.tree, 1)
+        lay.addWidget(tree_hint)
         return box
 
     def _build_mapping_panel(self) -> QWidget:
@@ -309,8 +317,8 @@ class MainWindow(QMainWindow):
         self.combined_check = QCheckBox(f"生成总表 {COMBINED_FILENAME}（追加 scene / point / label 等列）")
         self.combined_check.setChecked(True)
         self.combined_check.setToolTip(
-            "所有已标注车内/车外的场景合在一个文件里，末尾追加 scene、point、label（1 = 车内，0 = 车外）；\n"
-            "有小场景标注时再追加 sub_scene（类别名）、sub_label（类别编号）。未标注车内/车外的场景不写入总表。"
+            "所有有标签的点位合在一个文件里，末尾追加 source、scene、point、label（1 = 车内，0 = 车外）；\n"
+            "点位的标签默认跟随场景，单独设置过的以点位为准。没有标签的点位不写入总表。"
         )
         self.encoding_combo = QComboBox()
         self.encoding_combo.addItem("UTF-8 with BOM（Excel 可直接打开）", "utf-8-sig")
@@ -473,6 +481,7 @@ class MainWindow(QMainWindow):
 
     def _populate_tree(self) -> None:
         self.tree.clear()
+        self._point_items.clear()
         total = len(self.slaves)
         multi = len(self._sources) > 1
         scene_items: dict[str, QTreeWidgetItem] = {}
@@ -503,6 +512,7 @@ class MainWindow(QMainWindow):
             n_files = sum(len(v) for v in slave_files.values())
             item = QTreeWidgetItem([point, f"{len(slave_files)}/{total}", str(n_files)])
             item.setData(0, ROLE_POINT, key)
+            self._point_items[key] = item
             item.setTextAlignment(1, Qt.AlignmentFlag.AlignCenter)
             item.setTextAlignment(2, Qt.AlignmentFlag.AlignCenter)
             missing = [s for s in self.slaves if s not in slave_files]
@@ -513,7 +523,7 @@ class MainWindow(QMainWindow):
             container.addChild(item)
         for item in (*scene_items.values(), *source_items.values()):
             item.setText(2, f"{n_points[item]} 个点位")
-        # 标签和小场景下拉框只放在场景行
+        # 场景标签下拉框只放在场景行；点位行显示实际标签，点击单独修改
         for scene, item in scene_items.items():
             combo = QComboBox()
             combo.addItem("未标注", None)
@@ -522,54 +532,90 @@ class MainWindow(QMainWindow):
             combo.setCurrentIndex(max(combo.findData(self.config.scene_labels.get(scene)), 0))
             combo.currentIndexChanged.connect(lambda _i, sc=scene, c=combo: self._on_label_changed(sc, c))
             self.tree.setItemWidget(item, 3, combo)
-        self._sub_combos.clear()
-        for scene, item in scene_items.items():
-            combo = QComboBox()
-            self._fill_sub_combo(combo, scene)
-            combo.currentIndexChanged.connect(lambda _i, sc=scene, c=combo: self._on_sub_changed(sc, c))
-            self.tree.setItemWidget(item, 4, combo)
-            self._sub_combos[scene] = combo
+        self._refresh_point_label_cells()
         self.tree.expandAll()
-        for col in (1, 2, 3, 4):
+        for col in (1, 2, 3):
             self.tree.resizeColumnToContents(col)
 
-    def _fill_sub_combo(self, combo: QComboBox, scene: str) -> None:
-        combo.blockSignals(True)
-        combo.clear()
-        combo.addItem("未标注", None)
-        for cid, name in self.config.sub_categories.items():
-            combo.addItem(f"{cid} {name}", cid)
-        combo.addItem("＋ 新建类别…", NEW_SUB)
-        combo.setCurrentIndex(max(combo.findData(self.config.scene_subs.get(scene)), 0))
-        combo.blockSignals(False)
+    def _refresh_point_label_cells(self) -> None:
+        """点位行“标签”格：跟随场景时灰色，单独设置时蓝色加粗。"""
+        for (_source, scene, point), item in self._point_items.items():
+            label = self.config.label_for(scene, point)
+            overridden = self.config.is_point_overridden(scene, point)
+            item.setText(3, LABEL_TEXT.get(label, "未标注") + " ▾")
+            font = item.font(3)
+            font.setBold(overridden)
+            item.setFont(3, font)
+            item.setForeground(3, LABEL_COLOR_OVERRIDE if overridden else LABEL_COLOR_INHERIT)
+            scene_text = LABEL_TEXT.get(self.config.scene_labels.get(scene), "未标注")
+            item.setToolTip(
+                3,
+                f"单独设置（场景标签：{scene_text}）" if overridden else f"跟随场景（{scene_text}），点击可单独设置",
+            )
 
-    def _refresh_sub_combos(self) -> None:
-        for scene, combo in self._sub_combos.items():
-            self._fill_sub_combo(combo, scene)
-        self.tree.resizeColumnToContents(4)
+    def _point_keys(self, items) -> list[tuple[str, str, str]]:
+        return [tuple(k) for item in items if (k := item.data(0, ROLE_POINT))]
 
-    def _on_sub_changed(self, scene: str, combo: QComboBox) -> None:
-        cid = combo.currentData()
-        if cid == NEW_SUB:
-            cid = ask_new_sub_category(self, self.config)
-            if cid is None:  # 取消：恢复原来的选择
-                self._fill_sub_combo(combo, scene)
-                return
-            self._log(f"新建小场景类别 {cid}：{self.config.sub_categories[cid]}")
-        if cid is None:
-            self.config.scene_subs.pop(scene, None)
+    def _on_tree_clicked(self, item: QTreeWidgetItem, column: int) -> None:
+        keys = self._point_keys([item])
+        if column == 3 and keys:
+            rect = self.tree.visualItemRect(item)
+            pos = self.tree.viewport().mapToGlobal(rect.bottomLeft())
+            pos.setX(self.tree.viewport().mapToGlobal(self.tree.viewport().rect().topLeft()).x()
+                     + self.tree.header().sectionViewportPosition(3))
+            self._show_point_label_menu(keys, pos)
+
+    def _on_tree_context_menu(self, pos) -> None:
+        item = self.tree.itemAt(pos)
+        keys = self._point_keys(self.tree.selectedItems())
+        if item is not None and item.data(0, ROLE_POINT) and tuple(item.data(0, ROLE_POINT)) not in keys:
+            keys = self._point_keys([item])  # 右键的点位不在选中范围内时只改它
+        if keys:
+            self._show_point_label_menu(keys, self.tree.viewport().mapToGlobal(pos))
+
+    def _show_point_label_menu(self, keys: list[tuple[str, str, str]], global_pos) -> None:
+        pairs = sorted({(scene, point) for _source, scene, point in keys}, key=lambda p: (natural_key(p[0]), natural_key(p[1])))
+        scenes = {scene for scene, _ in pairs}
+        menu = QMenu(self)
+        menu.addSection(f"{len(pairs)} 个点位" if len(pairs) > 1 else f"{pairs[0][0]} / 点位 {pairs[0][1]}")
+        if len(scenes) == 1:
+            follow_text = f"跟随场景（{LABEL_TEXT.get(self.config.scene_labels.get(next(iter(scenes))), '未标注')}）"
         else:
-            self.config.scene_subs[scene] = cid
-        self._after_labels_changed(scene)
+            follow_text = "跟随各自场景"
+        current = None
+        if len(pairs) == 1:
+            scene, point = pairs[0]
+            current = (self.config.point_labels.get(scene, {}).get(point)
+                       if self.config.is_point_overridden(scene, point) else FOLLOW_SCENE)
+        for text, data in ((follow_text, FOLLOW_SCENE), (LABEL_TEXT[LABEL_INSIDE], LABEL_INSIDE),
+                           (LABEL_TEXT[LABEL_OUTSIDE], LABEL_OUTSIDE)):
+            action = menu.addAction(text)
+            action.setData(data)
+            action.setCheckable(current is not None)
+            action.setChecked(current == data)
+        chosen = self._exec_menu(menu, global_pos)
+        if chosen is not None:
+            data = chosen.data()
+            self._set_point_labels(pairs, None if data == FOLLOW_SCENE else data)
 
-    def _manage_sub_categories(self) -> None:
-        SubCategoryDialog(self.config, self).exec()
-        self._after_labels_changed()
+    def _exec_menu(self, menu: QMenu, global_pos):
+        """弹出菜单并返回选中的动作（单独成方法，便于测试替换）。"""
+        return menu.exec(global_pos)
+
+    def _set_point_labels(self, pairs: list[tuple[str, str]], label: int | None) -> None:
+        """单独设置若干 (场景, 点位) 的标签；label 为 None 表示恢复跟随场景。"""
+        for scene, point in pairs:
+            self.config.set_point_label(scene, point, label)
+        what = "跟随场景" if label is None else LABEL_TEXT[label]
+        shown = "、".join(f"{scene}/{point}" for scene, point in pairs[:5]) + (" 等" if len(pairs) > 5 else "")
+        self._log(f"点位标签 → {what}：{shown}（共 {len(pairs)} 个）")
+        scenes = {scene for scene, _ in pairs}
+        self._after_labels_changed(next(iter(scenes)) if len(scenes) == 1 else None)
 
     def _after_labels_changed(self, scene: str | None = None) -> None:
-        """标签或小场景改变后：保存、刷新下拉框与统计；scene 为空表示可能影响所有场景。"""
+        """场景或点位标签改变后：保存、刷新点位标签与统计；scene 为空表示可能影响多个场景。"""
         self._save_config()
-        self._refresh_sub_combos()
+        self._refresh_point_label_cells()
         self._update_stats()
         if self.current_point and (scene is None or self.current_point[1] == scene):
             self._show_point(self.current_point)
@@ -601,11 +647,10 @@ class MainWindow(QMainWindow):
         )
         if unlabeled:
             text += f"，<span style='color:#b45309'>未标注 {unlabeled}</span>"
-        if self.config.sub_categories:
-            no_sub = sum(s not in self.config.scene_subs for s in scenes)
-            text += f"\n小场景：已标注 {len(scenes) - no_sub}"
-            if no_sub:
-                text += f"，<span style='color:#b45309'>未标注 {no_sub}</span>"
+        pairs = {(scene, point) for _, scene, point in self.groups}
+        overridden = sum(self.config.is_point_overridden(scene, point) for scene, point in pairs)
+        if overridden:
+            text += f"；单独设置 {overridden} 个点位"
         self.stats_label.setText(text.replace("\n", "<br>"))
 
     def _populate_table(self) -> None:
@@ -800,10 +845,8 @@ class MainWindow(QMainWindow):
         title = [f"{scene} / 点位 {pt}"]
         if len(self._sources) > 1:
             title.append(source)
-        title.append(LABEL_TEXT.get(self.config.scene_labels.get(scene), "未标注"))
-        sub = self.config.scene_subs.get(scene)
-        if sub is not None:
-            title.append(f"小场景 {sub} {self.config.sub_categories[sub]}")
+        label_text = LABEL_TEXT.get(self.config.label_for(scene, pt), "未标注")
+        title.append(label_text + ("（单独设置）" if self.config.is_point_overridden(scene, pt) else ""))
         if frames:
             try:
                 tolerance = self.tolerance_spin.value()
@@ -866,27 +909,30 @@ class MainWindow(QMainWindow):
             if ok != QMessageBox.StandardButton.Yes:
                 return
 
-        scene_labels = scene_subs = None
+        scene_labels = point_labels = None
         if self.combined_check.isChecked():
             scenes = self._scenes()
+            pairs = sorted({(scene, point) for _, scene, point in self.groups})
             scene_labels = {sc: self.config.scene_labels[sc] for sc in scenes if sc in self.config.scene_labels}
-            if not scene_labels:
-                QMessageBox.warning(self, "提示", "生成总表需要先在左侧为场景选择标签（1 车内 / 0 车外）")
-                return
-            scene_subs = {
-                sc: (cid, self.config.sub_categories[cid])
-                for sc in scene_labels
-                if (cid := self.config.scene_subs.get(sc)) is not None
+            point_labels = {
+                (scene, point): self.config.point_labels[scene][point]
+                for scene, point in pairs
+                if self.config.is_point_overridden(scene, point)
             }
-            warnings = []
-            unlabeled = [sc for sc in scenes if sc not in scene_labels]
+            unlabeled: dict[str, int] = {}
+            for scene, point in pairs:
+                if self.config.label_for(scene, point) is None:
+                    unlabeled[scene] = unlabeled.get(scene, 0) + 1
+            if len(unlabeled) == len(scenes) and sum(unlabeled.values()) == len(pairs):
+                QMessageBox.warning(self, "提示", "生成总表需要先在左侧为场景或点位选择标签（1 车内 / 0 车外）")
+                return
             if unlabeled:
-                warnings.append(f"{'、'.join(unlabeled)} 未标注车内/车外，不会写入总表（单点位文件照常导出）。")
-            no_sub = [sc for sc in scene_labels if sc not in scene_subs]
-            if scene_subs and no_sub:
-                warnings.append(f"{'、'.join(no_sub)} 未标注小场景，总表中这些场景的 sub_scene / sub_label 为空。")
-            if warnings:
-                ok = QMessageBox.question(self, "标注不完整", "\n\n".join(warnings) + "\n\n是否继续？")
+                detail = "、".join(f"{sc}（{n} 个点位）" for sc, n in unlabeled.items())
+                ok = QMessageBox.question(
+                    self,
+                    "存在未标注的点位",
+                    f"{detail} 没有标签，不会写入总表（单点位文件照常导出）。\n\n是否继续？",
+                )
                 if ok != QMessageBox.StandardButton.Yes:
                     return
 
@@ -924,7 +970,7 @@ class MainWindow(QMainWindow):
         self._out_dir = out_dir
         self._thread = QThread(self)
         self._worker = ExportWorker(
-            self.groups, slave_to_anchor, anchor_order, out_dir, options, scene_labels, scene_subs
+            self.groups, slave_to_anchor, anchor_order, out_dir, options, scene_labels, point_labels
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)

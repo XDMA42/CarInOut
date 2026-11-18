@@ -104,41 +104,37 @@ def test_scene_labels_roundtrip(tmp_path: Path):
     assert AppConfig.load(cfg).scene_labels == {"座椅": 1, "车外": 0, "脚坑": 1}
 
 
-def test_sub_categories_ids_are_stable(tmp_path: Path):
-    from carinout.anchors import AppConfig
-
-    cfg = tmp_path / "config.json"
-    config = AppConfig.load(cfg)
-    front, trunk = config.add_sub_category("前排"), config.add_sub_category(" 后备箱 ")
-    assert (front, trunk) == (0, 1) and config.sub_categories[trunk] == "后备箱"
-    config.scene_subs.update({"中排座椅": front, "后备箱左": trunk, "后备箱右": trunk})
-
-    # 删除编号最大的类别后再新建，也不会复用它的编号
-    assert sorted(config.remove_sub_category(trunk)) == ["后备箱右", "后备箱左"]
-    assert config.scene_subs == {"中排座椅": front}
-    assert config.add_sub_category("车外左侧") == 2
-
-    config.save(cfg)
-    loaded = AppConfig.load(cfg)
-    assert loaded.sub_categories == {0: "前排", 2: "车外左侧"}
-    assert loaded.scene_subs == {"中排座椅": 0}
-    assert loaded.add_sub_category("车外右侧") == 3
-
-
-def test_sub_category_validation_and_bad_config(tmp_path: Path):
+def test_point_labels_override_scene_labels(tmp_path: Path):
     import json
 
     from carinout.anchors import AppConfig
 
     cfg = tmp_path / "config.json"
-    cfg.write_text(json.dumps({
-        "sub_categories": {"0": "前排", "x": "坏编号", "3": ""},
-        "scene_subs": {"a": 0, "b": 5, "c": "0"},
-    }), encoding="utf-8")
     config = AppConfig.load(cfg)
-    assert config.sub_categories == {0: "前排"}
-    assert config.scene_subs == {"a": 0}
-    assert config.validate_sub_category_name("前排") is not None
-    assert config.validate_sub_category_name("前排", cid=0) is None  # 重命名为自己
-    assert config.validate_sub_category_name("  ") is not None
-    assert config.validate_sub_category_name("后排") is None
+    config.scene_labels["中间座椅+脚坑"] = 1
+    config.set_point_label("中间座椅+脚坑", "69", 0)
+    config.set_point_label("车外左侧", "3", 1)  # 场景未标注，也可以只给某个点位打标签
+    assert config.label_for("中间座椅+脚坑", "68") == 1  # 跟随场景
+    assert config.label_for("中间座椅+脚坑", "69") == 0  # 单独设置
+    assert config.label_for("车外左侧", "3") == 1 and config.label_for("车外左侧", "4") is None
+    assert config.is_point_overridden("中间座椅+脚坑", "69") and not config.is_point_overridden("中间座椅+脚坑", "68")
+
+    # 场景标签改了，单独设置的点位不受影响
+    config.scene_labels["中间座椅+脚坑"] = 0
+    config.set_point_label("中间座椅+脚坑", "69", 1)
+    assert config.label_for("中间座椅+脚坑", "68") == 0 and config.label_for("中间座椅+脚坑", "69") == 1
+
+    config.save(cfg)
+    loaded = AppConfig.load(cfg)
+    assert loaded.point_labels == {"中间座椅+脚坑": {"69": 1}, "车外左侧": {"3": 1}}
+
+    # 恢复跟随场景后不留空字典
+    loaded.set_point_label("车外左侧", "3", None)
+    assert "车外左侧" not in loaded.point_labels
+
+    # 旧配置里的小场景字段和无效的点位标签被忽略
+    cfg.write_text(json.dumps({
+        "point_labels": {"a": {"1": 0, "2": 5, "3": True}, "b": "bad", "c": {"9": 2}},
+        "sub_categories": {"0": "前排"}, "scene_subs": {"a": 0},
+    }), encoding="utf-8")
+    assert AppConfig.load(cfg).point_labels == {"a": {"1": 0}}
